@@ -1131,8 +1131,8 @@ export async function create({ renderer }) {
     frutal3: { label: '🫐 Frutal morado', make: () => meshOf('frutal3') },
     floral: { label: '🌸 Floral', make: () => meshOf('floral') },
     // animales: los mismos modelos de fauna, colocables de forma estática (build* están hoisted)
-    ave:     { label: '🐦 Ave',     make: () => buildBird().g },
-    pez:     { label: '🐟 Pez',     make: () => { const g = buildFish(fishMats[0]); g.scale.setScalar(1.6); return g; } },
+    ave:     { label: '🐦 Ave',     make: () => { const g = buildBird().g; g.scale.setScalar(0.2); return g; } },   // ~0.5 m
+    pez:     { label: '🐟 Pez',     make: () => { const g = buildFish(fishMats[0]); g.scale.setScalar(0.22); return g; } },  // ~0.5 m
     delfin:  { label: '🐬 Delfín',  make: () => buildDolphin().g },
     tiburon: { label: '🦈 Tiburón', make: () => buildShark().g },
     ballena: { label: '🐋 Ballena', make: () => { const o = buildWhale().g; o.scale.setScalar(0.5); return o; } },
@@ -1558,9 +1558,9 @@ export async function create({ renderer }) {
       const w = buildWhale(); w.g.scale.setScalar(1.0 + Math.random() * 0.6); w.g.visible = false;
       faunaGroup.add(w.g);
       whales.push(Object.assign(w, {
-        R: SIZE * (0.40 + Math.random() * 0.06), ang: Math.random() * 6.283,
+        R: SIZE * (0.30 + Math.random() * 0.08), ang: Math.random() * 6.283,
         spd: (0.02 + Math.random() * 0.02) * (Math.random() < 0.5 ? -1 : 1),
-        state: 'wait', timer: 4 + Math.random() * 16, swimLeft: 0, spoutT: 0, spoutScale: 0,
+        state: 'wait', timer: 2 + Math.random() * 6, swimLeft: 0, spoutT: 0, spoutScale: 0,
       }));
     }
     // --- TIBURONES: BAJA probabilidad; patrullan cerca de la superficie con la aleta dorsal cortando el agua ---
@@ -1595,10 +1595,10 @@ export async function create({ renderer }) {
     for (const L of lakeInfo) {
       const n = 2 + (Math.random() * 3 | 0);
       for (let k = 0; k < n; k++) {
-        const size = 0.7 + Math.random() * 1.7;
+        const size = 0.15 + Math.random() * 0.13;      // ~0.35-0.6 m (real)
         const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]);
-        g.scale.setScalar(size); g.visible = false; faunaGroup.add(g);
-        fishes.push({ g, cx: L.x, cz: L.z, area: L.r * 0.7, surf: L.level, jumpH: 1.2 + size * 1.6, size,
+        g.scale.setScalar(size); faunaGroup.add(g);
+        fishes.push({ g, cx: L.x, cz: L.z, area: L.r * 0.7, surf: L.level, jumpH: 0.4 + size * 2.0, size,
           state: 'wait', timer: Math.random() * 6, t: 0, dur: 0, jx: L.x, jz: L.z, dx: 1, dz: 0 });
       }
     }
@@ -1607,10 +1607,10 @@ export async function create({ renderer }) {
       const want = Math.min(riverPts.length, 10);
       for (let k = 0; k < want; k++) {
         const p = riverPts[(Math.random() * riverPts.length) | 0];
-        const size = 0.28 + Math.random() * 0.34;
+        const size = 0.1 + Math.random() * 0.08;       // ~0.2-0.4 m (real, río)
         const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]);
-        g.scale.setScalar(size); g.visible = false; faunaGroup.add(g);
-        fishes.push({ g, cx: p.x, cz: p.z, area: 1.5, surf: p.y + 0.3, jumpH: 0.5 + size * 1.2, size,
+        g.scale.setScalar(size); faunaGroup.add(g);
+        fishes.push({ g, cx: p.x, cz: p.z, area: 1.5, surf: p.y + 0.15, jumpH: 0.3 + size * 1.6, size,
           state: 'wait', timer: Math.random() * 5, t: 0, dur: 0, jx: p.x, jz: p.z, dx: 1, dz: 0 });
       }
     }
@@ -1626,24 +1626,24 @@ export async function create({ renderer }) {
     for (const w of whales) {                   // ballenas: máquina de estados (espera larga ↔ pasada)
       if (w.state === 'wait') {
         w.timer -= dt;
-        if (w.timer <= 0) { w.state = 'swim'; w.swimLeft = 2.0 + Math.random() * 3.0; w.g.visible = true; w.spoutT = 1 + Math.random() * 3; }
+        if (w.timer <= 0) { w.state = 'swim'; w.swimLeft = 5 + Math.random() * 6; w.g.visible = true; w.spoutT = 1 + Math.random() * 3; }
       } else {
         w.swimLeft -= dt * Math.abs(w.spd); w.ang += w.spd * dt;
         const x = Math.cos(w.ang) * w.R, z = Math.sin(w.ang) * w.R, sgn = Math.sign(w.spd);
         const dxdir = -Math.sin(w.ang) * sgn, dzdir = Math.cos(w.ang) * sgn;
-        w.g.position.set(x, -1.4 + Math.sin(t * 0.5) * 0.5, z);
+        w.g.position.set(x, -0.9 + Math.sin(t * 0.5) * 0.4, z);   // lomo bien expuesto sobre la superficie
         w.g.rotation.y = Math.atan2(-dzdir, dxdir);
         w.tail.rotation.y = Math.sin(t * 1.2) * 0.3;
         w.spoutT -= dt;
         if (w.spoutT <= 0) { w.spout.visible = true; w.spoutScale = 1.4; w.spoutT = 6 + Math.random() * 6; }
         if (w.spout.visible) { w.spoutScale -= dt * 1.1; if (w.spoutScale <= 0) w.spout.visible = false; else w.spout.scale.setScalar(0.4 + w.spoutScale); }
-        if (w.swimLeft <= 0 || heightAt(x, z) >= -2) { w.state = 'wait'; w.timer = 18 + Math.random() * 30; w.g.visible = false; w.spout.visible = false; }
+        if (w.swimLeft <= 0 || heightAt(x, z) >= -2) { w.state = 'wait'; w.timer = 8 + Math.random() * 14; w.g.visible = false; w.spout.visible = false; }
       }
     }
     for (const s of sharks) {                   // tiburones: patrullan en superficie, aleta dorsal cortando el agua
       s.ang += s.spd * dt; const sgn = Math.sign(s.spd);
       const x = Math.cos(s.ang) * s.R, z = Math.sin(s.ang) * s.R;
-      s.g.position.set(x, -0.55 + Math.sin(t * 0.8 + s.ph) * 0.12, z);   // lomo casi a ras → solo asoma la aleta
+      s.g.position.set(x, -0.3 + Math.sin(t * 0.8 + s.ph) * 0.1, z);   // lomo a ras → asoman aleta dorsal y dorso
       s.g.rotation.y = Math.atan2(-Math.cos(s.ang) * sgn, -Math.sin(s.ang) * sgn);
       s.g.rotation.z = Math.sin(t * 2.2 + s.ph) * 0.06;                  // leve coleo
     }
@@ -1656,18 +1656,30 @@ export async function create({ renderer }) {
       d.g.rotation.y = Math.atan2(-Math.cos(d.ang) * sgn, -Math.sin(d.ang) * sgn);
       d.g.rotation.z = Math.cos(ph) * 0.9;             // morro arriba al subir, abajo al bajar
     }
-    for (const f of fishes) {                   // peces: salto en arco con morro arriba/abajo
-      if (f.state === 'wait') {
+    for (const f of fishes) {                   // peces: nadan visibles a ras de superficie y saltan cada tanto
+      if (f.hd === undefined) {                  // init perezoso del crucero
+        f.hd = Math.random() * 6.283; f.px = f.cx; f.pz = f.cz; f.phase = Math.random() * 6.283; f.t2 = 0;
+      }
+      f.g.visible = true;
+      if (f.state === 'wait') {                  // crucero: deriva lenta serpenteando dentro de su zona
+        f.t2 += dt;
+        f.hd += (Math.random() - 0.5) * dt * 1.4;
+        const sp = 0.3 + f.size * 1.2;
+        f.px += Math.cos(f.hd) * sp * dt; f.pz += Math.sin(f.hd) * sp * dt;
+        const dx0 = f.px - f.cx, dz0 = f.pz - f.cz, dist = Math.hypot(dx0, dz0) || 1;
+        if (dist > f.area) { f.hd += Math.PI; f.px = f.cx + dx0 / dist * f.area; f.pz = f.cz + dz0 / dist * f.area; }
+        const bob = Math.sin(f.t2 * 2 + f.phase) * 0.03 * f.size;
+        f.g.position.set(f.px, f.surf - f.size * 0.12 + bob, f.pz);   // lomo justo rompiendo la superficie
+        f.g.rotation.set(0, Math.atan2(-Math.sin(f.hd), Math.cos(f.hd)), Math.sin(f.t2 * 7 + f.phase) * 0.12);
         f.timer -= dt;
-        if (f.timer <= 0) {
-          const a = Math.random() * 6.283, rr = Math.random() * f.area;
-          f.jx = f.cx + Math.cos(a) * rr; f.jz = f.cz + Math.sin(a) * rr;
-          const da = Math.random() * 6.283; f.dx = Math.cos(da); f.dz = Math.sin(da);
-          f.t = 0; f.dur = 0.75 + Math.random() * 0.4; f.state = 'jump'; f.g.visible = true;
+        if (f.timer <= 0) {                      // arranca un salto desde la posición actual
+          f.jx = f.px; f.jz = f.pz; f.dx = Math.cos(f.hd); f.dz = Math.sin(f.hd);
+          f.t = 0; f.dur = 0.75 + Math.random() * 0.4; f.state = 'jump';
         }
-      } else {
+      } else {                                   // salto en arco con morro arriba/abajo
         f.t += dt; const p = f.t / f.dur;
-        if (p >= 1) { f.state = 'wait'; f.timer = 2 + Math.random() * 7; f.g.visible = false; continue; }
+        if (p >= 1) { f.state = 'wait'; f.timer = 3 + Math.random() * 6;
+          f.px = f.jx + f.dx * f.size * 0.75; f.pz = f.jz + f.dz * f.size * 0.75; continue; }
         const travel = f.size * 1.5;
         f.g.position.set(f.jx + f.dx * travel * (p - 0.5), f.surf + f.jumpH * Math.sin(p * Math.PI), f.jz + f.dz * travel * (p - 0.5));
         f.g.rotation.set(0, Math.atan2(-f.dz, f.dx), Math.cos(p * Math.PI) * 1.0);
