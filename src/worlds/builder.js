@@ -787,18 +787,23 @@ export async function create({ renderer }) {
       lakeMask[idx] = 1;                  // marca agua dulce de lago → humedad fuerte alrededor
       const x0 = (i / SEG - 0.5) * SIZE, z0 = (j / SEG - 0.5) * SIZE;
       const x1 = ((i + 1) / SEG - 0.5) * SIZE, z1 = ((j + 1) / SEG - 0.5) * SIZE;
-      verts.push(x0, level, z0, x1, level, z0, x1, level, z1, x0, level, z1);
+      // se teje en el plano LOCAL XY (mirando a +Z); luego se rota -90°X → +Y. El Reflector
+      // de Water asume normal local +Z, así refleja el CIELO (antes lo hacía de lado → "pintura").
+      verts.push(x0, -z0, 0, x1, -z0, 0, x1, -z1, 0, x0, -z1, 0);
       idxs.push(vi, vi + 1, vi + 2, vi, vi + 2, vi + 3); vi += 4;
     }
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
     g.setIndex(idxs); g.computeVertexNormals();
-    // agua REFLECTANTE real (misma clase que el mar; usa posición de mundo, no necesita UVs)
+    // agua REFLECTANTE real (misma clase que el mar)
     const lake = new Water(g, {
-      textureWidth: 256, textureHeight: 256, waterNormals: lakeNormals,
+      textureWidth: 512, textureHeight: 512, waterNormals: lakeNormals,
       sunDirection: sun.clone().normalize(), sunColor: 0xffffff,
-      waterColor: 0x2a6f92, distortionScale: 1.2, fog: false,
+      waterColor: 0x1f6b86, distortionScale: 2.5, fog: false,
     });
+    lake.material.uniforms.size.value = 6;        // olas densas a escala de lago (si no, se ve plano)
+    lake.material.side = THREE.DoubleSide;
+    lake.rotation.x = -Math.PI / 2; lake.position.y = level;
     waterGroup.add(lake); lakeWaters.push(lake);
   }
   function buildRiverRibbon(cl, halfW) {
