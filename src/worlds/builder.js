@@ -1130,7 +1130,21 @@ export async function create({ renderer }) {
     frutal2: { label: '🍊 Frutal naranja', make: () => meshOf('frutal2') },
     frutal3: { label: '🫐 Frutal morado', make: () => meshOf('frutal3') },
     floral: { label: '🌸 Floral', make: () => meshOf('floral') },
+    // animales: los mismos modelos de fauna, colocables de forma estática (build* están hoisted)
+    ave:     { label: '🐦 Ave',     make: () => buildBird().g },
+    pez:     { label: '🐟 Pez',     make: () => { const g = buildFish(fishMats[0]); g.scale.setScalar(1.6); return g; } },
+    delfin:  { label: '🐬 Delfín',  make: () => buildDolphin().g },
+    tiburon: { label: '🦈 Tiburón', make: () => buildShark().g },
+    ballena: { label: '🐋 Ballena', make: () => { const o = buildWhale().g; o.scale.setScalar(0.5); return o; } },
   };
+  // agrupación de la paleta de assets por tipo (orden y títulos de las secciones de la izquierda)
+  const assetGroups = [
+    { title: 'Árboles',  keys: ['arbol', 'pino', 'palmera', 'frutal', 'frutal2', 'frutal3', 'floral'] },
+    { title: 'Plantas',  keys: ['arbusto', 'hierba', 'cactus'] },
+    { title: 'Rocas',    keys: ['rocas', 'formacion'] },
+    { title: 'Animales', keys: ['ave', 'pez', 'delfin', 'tiburon', 'ballena'] },
+    { title: 'Otros',    keys: ['persona'] },
+  ];
 
   // ---- vegetación INSTANCIADA en GPU con CULLING + LOD ----
   // Cada tipo guarda sus instancias en arrays planos (id lógico = índice, estable para editar/borrar).
@@ -1739,6 +1753,8 @@ export async function create({ renderer }) {
     #asset-palette h4:not(:first-child) { margin-top: 12px; }
     #asset-palette h4 { color: #cfe0ff; font-size: 12px; letter-spacing: .5px; margin: 2px 4px 8px;
       text-transform: uppercase; opacity: .8; }
+    #asset-palette h5 { color: #9db6e6; font-size: 10.5px; letter-spacing: .4px; margin: 9px 4px 4px;
+      text-transform: uppercase; opacity: .65; font-weight: 600; }
     #asset-palette button { display: block; width: 100%; text-align: left; margin: 4px 0; cursor: pointer;
       background: rgba(40,60,95,.5); color: #e7eefc; border: 1px solid transparent; border-radius: 8px;
       padding: 8px 10px; font-size: 14px; transition: background .12s, border-color .12s; }
@@ -1754,7 +1770,10 @@ export async function create({ renderer }) {
   biomeKeys.forEach((k, n) => { h += `<button data-id="b:${n + 1}">${BIOMES[k].label}</button>`; });
   h += '<button data-id="b:0">🧽 Borrar bioma</button>';
   h += '<h4>Colocar asset</h4>';
-  for (const k of Object.keys(assetDefs)) h += `<button data-id="a:${k}">${assetDefs[k].label}</button>`;
+  for (const grp of assetGroups) {
+    h += `<h5>${grp.title}</h5>`;
+    for (const k of grp.keys) if (assetDefs[k]) h += `<button data-id="a:${k}">${assetDefs[k].label}</button>`;
+  }
   h += '<div class="hintline">Pinta biomas o coloca assets con clic-izquierdo sobre el terreno.</div>';
   paletteEl.innerHTML = h;
   document.body.appendChild(paletteEl);
