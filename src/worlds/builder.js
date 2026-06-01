@@ -24,6 +24,18 @@ export async function create({ renderer }) {
     strength: 0.9,          // fuerza por pasada
     mar: true,
     wireframe: false,
+    heatmap: false,         // vista de clasificación de relieve (playa/acantilado/barranco/…)
+    timeOfDay: 9,           // hora del día (0-24); controla sol, luna y estrellas
+    dayCycle: true,         // avanzar la hora automáticamente
+    daySeconds: 120,        // duración de un día completo (s)
+    moonPhase: 0.5,         // 0 luna nueva · 0.5 llena · 1 nueva otra vez
+    moonCycle: true,        // avanzar las fases de la luna automáticamente
+    season: 0.05,           // 0 primavera · 0.25 verano · 0.5 otoño · 0.75 invierno
+    seasonCycle: true,      // avanzar las estaciones automáticamente
+    seasonSeconds: 240,     // duración de un año completo (s)
+    weather: true,          // clima localizado (nubes/lluvia/niebla por zonas)
+    weatherAmount: 0.5,     // 0 despejado … 1 muy cubierto (densidad de celdas)
+    shoreWaves: true,       // olas/espuma rompiendo en la orilla
   };
 
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -34,22 +46,118 @@ export async function create({ renderer }) {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 200000);
 
-  // cielo + sol
+  // ===== CICLO DÍA/NOCHE: sol, luna con fases y estrellas, todo en función de params.timeOfDay =====
+  const TWO_PI = Math.PI * 2;
+  const SKY_TILT = 0.35;                 // inclinación del arco diurno (da deriva norte-sur al recorrido)
+  function celestialDir(A, out) {        // dirección en el cielo para un ángulo de arco A (0=sale E · π/2=cenit · π=se pone O · 3π/2=bajo tierra)
+    return out.set(Math.cos(A), Math.sin(A) * Math.cos(SKY_TILT), Math.sin(A) * Math.sin(SKY_TILT));
+  }
+
+  // cielo
   const sky = new Sky(); sky.scale.setScalar(90000); scene.add(sky);
   sky.material.uniforms.turbidity.value = 5;
   sky.material.uniforms.rayleigh.value = 1.4;
   sky.material.uniforms.mieCoefficient.value = 0.004;
   sky.material.uniforms.mieDirectionalG.value = 0.85;
   const sun = new THREE.Vector3();
-  sun.setFromSphericalCoords(1, THREE.MathUtils.degToRad(58), THREE.MathUtils.degToRad(135));
+  const moonDir = new THREE.Vector3();
+  celestialDir((params.timeOfDay / 24 - 0.25) * TWO_PI, sun);
   sky.material.uniforms.sunPosition.value.copy(sun);
 
+  // sol (luz direccional con sombras) + relleno hemisférico
   const sunLight = new THREE.DirectionalLight(0xfff2dd, 2.1);
   sunLight.castShadow = true;
   sunLight.shadow.mapSize.set(2048, 2048);
   sunLight.shadow.bias = -0.0004;
   scene.add(sunLight, sunLight.target);
-  scene.add(new THREE.HemisphereLight(0xcfe0ff, 0x55633f, 0.7));
+  const hemiLight = new THREE.HemisphereLight(0xcfe0ff, 0x55633f, 0.7);
+  scene.add(hemiLight);
+  const _warmLow = new THREE.Color(0xff8a3c), _warmHigh = new THREE.Color(0xfff2dd);
+
+  // luna: esfera iluminada por la dirección REAL del sol → el terminador dibuja la fase correcta sola
+  const moonLight = new THREE.DirectionalLight(0x9fb6e0, 0.0);   // ilumina suavemente el terreno de noche
+  scene.add(moonLight, moonLight.target);
+  const moonMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    uniforms: {
+      uSun: { value: new THREE.Vector3(1, 0, 0) },
+      uLit: { value: new THREE.Color(0xf2f0e6) },
+      uDark: { value: new THREE.Color(0x222a3a) },
+      uOpacity: { value: 1.0 },
+    },
+    vertexShader: `
+      varying vec3 vN;
+      void main() {
+        vN = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 uSun; uniform vec3 uLit; uniform vec3 uDark; uniform float uOpacity;
+      varying vec3 vN;
+      void main() {
+        float d = dot(normalize(vN), normalize(uSun));
+        float lit = smoothstep(-0.08, 0.12, d);     // terminador suave → media luna / gibosa / llena
+        gl_FragColor = vec4(mix(uDark, uLit, lit), uOpacity);
+      }`,
+  });
+  const moon = new THREE.Mesh(new THREE.SphereGeometry(2300, 32, 24), moonMat);
+  moon.renderOrder = 1;
+  scene.add(moon);
+
+  // estrellas: puntos repartidos por la bóveda alta; se desvanecen de día
+  const starGeo = new THREE.BufferGeometry();
+  const STAR_N = 1600, starPos = new Float32Array(STAR_N * 3);
+  for (let i = 0; i < STAR_N; i++) {
+    const th = Math.acos(Math.random()), ph = Math.random() * TWO_PI;   // solo hemisferio superior (cielo)
+    const r = 82000;
+    starPos[i * 3]     = r * Math.sin(th) * Math.cos(ph);
+    starPos[i * 3 + 1] = r * Math.cos(th);
+    starPos[i * 3 + 2] = r * Math.sin(th) * Math.sin(ph);
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+  // sprite redondo y suave → puntitos en vez de cuadros duros (también en el reflejo del agua)
+  const starCanvas = document.createElement('canvas'); starCanvas.width = starCanvas.height = 32;
+  const sctx = starCanvas.getContext('2d');
+  const sgrad = sctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+  sgrad.addColorStop(0.0, 'rgba(255,255,255,1)');
+  sgrad.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+  sgrad.addColorStop(1.0, 'rgba(255,255,255,0)');
+  sctx.fillStyle = sgrad; sctx.fillRect(0, 0, 32, 32);
+  const starTex = new THREE.CanvasTexture(starCanvas);
+  const starMat = new THREE.PointsMaterial({ color: 0xdfe8ff, map: starTex, size: 6, sizeAttenuation: false,
+    transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending });
+  const stars = new THREE.Points(starGeo, starMat);
+  scene.add(stars);
+
+  // recalcula sol/luna/luces/cielo a partir de params.timeOfDay y params.moonPhase
+  function updateSky() {
+    const As = (params.timeOfDay / 24 - 0.25) * TWO_PI;   // hora → ángulo de arco del sol
+    celestialDir(As, sun);
+    const elong = params.moonPhase * TWO_PI;              // separación luna-sol → fase
+    celestialDir(As - elong, moonDir);                    // la luna sigue al sol con un retraso = elongación
+    const dayF = THREE.MathUtils.smoothstep(sun.y, -0.06, 0.20);     // 0 noche · 1 día
+    const moonUp = THREE.MathUtils.smoothstep(moonDir.y, -0.05, 0.18);
+    const fullness = 0.5 * (1 - Math.cos(elong));         // 0 nueva … 1 llena
+    const SZ = SIZE || 1000;
+    // CIELO + SOL
+    sky.material.uniforms.sunPosition.value.copy(sun);
+    sunLight.intensity = 2.3 * dayF;
+    sunLight.color.copy(_warmLow).lerp(_warmHigh, THREE.MathUtils.smoothstep(sun.y, 0.02, 0.5));
+    sunLight.position.copy(sun).multiplyScalar(SZ * 1.5);
+    sunLight.target.position.set(0, 0, 0);
+    // LUNA
+    moon.position.copy(moonDir).multiplyScalar(60000);
+    moonMat.uniforms.uSun.value.copy(sun).normalize();
+    moonMat.uniforms.uOpacity.value = moonUp;             // se oculta bajo el horizonte
+    moonLight.position.copy(moonDir).multiplyScalar(SZ * 1.5);
+    moonLight.target.position.set(0, 0, 0);
+    moonLight.intensity = 0.45 * moonUp * fullness * (1 - dayF * 0.85);
+    // RELLENO + ESTRELLAS + EXPOSICIÓN + BRILLO DEL AGUA
+    hemiLight.intensity = THREE.MathUtils.lerp(0.10, 0.7, dayF);
+    starMat.opacity = (1 - dayF) * 0.9;
+    renderer.toneMappingExposure = THREE.MathUtils.lerp(0.55, 1.0, dayF);
+    water.material.uniforms.sunDirection.value.copy(dayF > 0.12 ? sun : moonDir).normalize();
+  }
 
   // mar (enorme y fijo; cubre cualquier tamaño de mapa)
   const water = new Water(new THREE.PlaneGeometry(120000, 120000), {
@@ -86,11 +194,14 @@ export async function create({ renderer }) {
   }
   let rng = Math.random;        // se reemplaza por mulberry32(semilla) al generar
   let currentSeed = null;       // semilla de la isla actual (para guardar)
-  const SAVE_KEY = 'evermark_island_v1';
+  const SAVE_KEY = 'evermark_island_v1';      // slot rápido (autocarga al entrar)
+  const LIB_KEY = 'evermark_islands_lib_v1';  // biblioteca de mapas guardados con nombre
 
   // ---- estado del terreno (depende del tamaño) ----
   let SIZE, SEG, N, CELL, LAND_MAX, SEA_FLOOR, STRENGTH_SCALE, BEACH_TOP;
   let geo = null, mesh = null, height = null, colors = null, posAttr = null, biomes = null, waterMask = null;
+  let relief = null;            // clase de relieve por celda (playa/acantilado/barranco/… → terrainClassAt)
+  let seasonSnowY = 1e9;        // cota de la línea de nieve (cambia con la estación; nieve solo por encima)
   let lakeMask = null;          // 1 en celdas de LAGO (agua dulce) → humedad más fuerte que los ríos
   let wetField = null;          // 0..1 proximidad al agua (alto cerca de agua, decae con la distancia)
   let lakeInfo = [];            // {x,z,level,r} por lago → peces de lago (varios tamaños)
@@ -172,6 +283,10 @@ export async function create({ renderer }) {
   const ROCK_COL = [120, 110, 86];
   function colorVert(idx) {
     const h = height[idx], o = idx * 3;
+    if (params.heatmap && relief) {                 // vista de relieve: color por clase geomorfológica
+      const c = RELIEF_COLORS[relief[idx]];
+      colors[o] = c[0] / 255; colors[o + 1] = c[1] / 255; colors[o + 2] = c[2] / 255; return;
+    }
     if (waterMask && waterMask[idx]) { colors[o] = 0.13; colors[o + 1] = 0.28; colors[o + 2] = 0.38; return; } // lecho de río/lago
     if (h < 0) { rampColor(h, colors, o); return; }
     const i = idx % N, j = (idx / N) | 0;
@@ -181,6 +296,11 @@ export async function create({ renderer }) {
     else { const c = lerpStops(LAND_STOPS, Math.min(1, h / LAND_MAX)); r = c[0]; g = c[1]; bl = c[2]; }
     const rk = Math.min(1, Math.max(0, (slopeAt(i, j) - 0.5) / 0.8));   // 0 llano .. 1 acantilado
     r = r * (1 - rk) + ROCK_COL[0] * rk; g = g * (1 - rk) + ROCK_COL[1] * rk; bl = bl * (1 - rk) + ROCK_COL[2] * rk;
+    if (h > seasonSnowY) {                                      // nieve dinámica: solo por encima de la línea de nieve estacional
+      let sa = Math.min(1, (h - seasonSnowY) / (LAND_MAX * 0.10 + 1));
+      sa *= 1 - rk * 0.7;                                       // apenas cuaja en paredes muy escarpadas
+      r = r * (1 - sa) + 252 * sa; g = g * (1 - sa) + 252 * sa; bl = bl * (1 - sa) + 255 * sa;
+    }
     const jit = 0.9 + 0.2 * hash(idx * 0.137, idx * 0.911);     // grano natural
     const shade = (1 - rk * 0.22) * jit;                        // laderas algo más oscuras
     colors[o] = (r / 255) * shade; colors[o + 1] = (g / 255) * shade; colors[o + 2] = (bl / 255) * shade;
@@ -212,6 +332,7 @@ export async function create({ renderer }) {
     for (let i = 0; i < N * N; i++) posAttr.setZ(i, height[i]);
     posAttr.needsUpdate = true;
     geo.computeVertexNormals();
+    computeRelief();        // clasifica el relieve final → terrainClassAt / heatmap
     recolorAll();
   }
 
@@ -375,6 +496,7 @@ export async function create({ renderer }) {
     scatterVegetationAll();         // siembra la vegetación de cada bioma por todo el mapa
     refresh();
     spawnFauna();                   // aves, ballenas y peces acordes al agua generada
+    buildShoreFoam();               // olas/espuma a lo largo de la costa generada
   }
 
   // ---- biomas automáticos: clasifica cada vértice de tierra por altura, humedad y pendiente ----
@@ -393,6 +515,64 @@ export async function create({ renderer }) {
     }
     return false;
   }
+  // ====== CLASIFICACIÓN DE RELIEVE (por forma del terreno, no por vegetación) ======
+  // Deriva de altura + pendiente + curvatura + cercanía al mar. Consultable con terrainClassAt(x,z)
+  // para colocar fauna/assets por geomorfología (p.ej. un ave que solo anida en acantilados).
+  const RELIEF_CLASSES = ['río/lago', 'mar', 'orilla', 'playa', 'llano', 'meseta', 'ladera', 'acantilado', 'barranco', 'cima'];
+  const RELIEF_COLORS = [
+    [60, 140, 200],   // 0 río/lago
+    [30, 70, 120],    // 1 mar
+    [225, 205, 150],  // 2 orilla
+    [240, 225, 170],  // 3 playa
+    [150, 200, 110],  // 4 llano
+    [120, 170, 90],   // 5 meseta
+    [185, 160, 90],   // 6 ladera
+    [205, 85, 65],    // 7 acantilado (pared escarpada)
+    [150, 60, 145],   // 8 barranco (quebrada/cárcava cóncava)
+    [245, 245, 255],  // 9 cima
+  ];
+  function classifyRelief(i, j) {
+    const idx = j * N + i, h = height[idx];
+    if (waterMask && waterMask[idx]) return 0;     // cauce de río o lago
+    if (h < 0) return 1;                           // mar
+    const slope = slopeAt(i, j);
+    const hl = height[j * N + Math.max(0, i - 1)], hr = height[j * N + Math.min(N - 1, i + 1)];
+    const hd = height[Math.max(0, j - 1) * N + i], hu = height[Math.min(N - 1, j + 1) * N + i];
+    const curv = ((hl + hr + hu + hd) / 4 - h) / (CELL || 1);   // >0 cóncavo (valle/quebrada) · <0 convexo (cresta)
+    const coast = seaWithin(i, j, 2), e = h / LAND_MAX;
+    if (h < BEACH_TOP * 0.5 && coast) return 2;    // orilla (línea de costa)
+    if (h < BEACH_TOP * 1.3 && slope < 0.5) return 3;            // playa
+    if (slope > 1.0) return curv > 0.18 ? 8 : 7;   // pared escarpada: cóncava=barranco · si no=acantilado
+    if (slope > 0.45) return 6;                    // ladera
+    if (e > 0.62 && curv < -0.12) return 9;        // cima/cresta convexa alta
+    if (e > 0.32) return 5;                         // meseta / tierra media plana
+    return 4;                                       // llano bajo
+  }
+  function computeRelief() {
+    if (!relief) return;
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) relief[j * N + i] = classifyRelief(i, j);
+  }
+  // API: clase de relieve en coords de mundo (string), p.ej. 'acantilado'
+  function terrainClassAt(wx, wz) {
+    const c = worldToIndex(wx, wz);
+    if (!relief || c.i < 0 || c.j < 0 || c.i >= N || c.j >= N) return 'mar';
+    return RELIEF_CLASSES[relief[c.j * N + c.i]];
+  }
+  // API: hasta n posiciones {x,z,y} de una clase de relieve (para sembrar fauna por geomorfología)
+  function findReliefSpots(className, n = 1) {
+    const want = RELIEF_CLASSES.indexOf(className);
+    const out = [];
+    if (want < 0 || !relief) return out;
+    const total = N * N, start = (Math.random() * total) | 0;   // recorrido desde un offset aleatorio
+    for (let s = 0; s < total && out.length < n; s++) {
+      const idx = (start + s * 9973) % total;                   // salto coprimo → muestreo disperso
+      if (relief[idx] !== want) continue;
+      const i = idx % N, j = (idx / N) | 0, w = vertWorld(i, j);
+      out.push({ x: w.x, z: w.z, y: height[idx] });
+    }
+    return out;
+  }
+
   function autoBiome() {
     const moff = rng() * 100, mfreq = 2.2 + rng() * 1.6;   // humedad: parches grandes
     // gradiente de humedad: un lado de la isla seco (desierto) y otro húmedo (selva)
@@ -437,7 +617,7 @@ export async function create({ renderer }) {
       biomes[idx] = idxOf(b);
     }
   }
-  function flat() { clearWater(); height.fill(SEA_FLOOR); biomes.fill(0); refresh(); }   // vacía a océano
+  function flat() { clearWater(); height.fill(SEA_FLOOR); biomes.fill(0); refresh(); clearFoam(); }   // vacía a océano
 
   // ===== EROSIÓN HIDRÁULICA (gotas) — talla valles/cárcavas y deposita sedimento =====
   function heightGrad(px, py) {
@@ -884,6 +1064,7 @@ export async function create({ renderer }) {
     height = new Float32Array(N * N);
     biomes = new Uint8Array(N * N);
     waterMask = new Uint8Array(N * N);
+    relief = new Uint8Array(N * N);
     lakeMask = new Uint8Array(N * N);
     colors = new Float32Array(N * N * 3);
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -1252,8 +1433,10 @@ export async function create({ renderer }) {
   }
 
   let placed = [];
-  let selKind = 'sculpt', selKey = null, paletteEl = null;
+  let selKind = 'nav', selKey = null, paletteEl = null;   // arranca en NAVEGAR (no edita al primer clic)
+  const ANIMAL_KEYS = new Set(['ave', 'pez', 'delfin', 'tiburon', 'ballena']);
   function placeAsset(key, x, y, z) {
+    if (ANIMAL_KEYS.has(key)) { spawnPlacedAnimal(key, x, y, z); return; }   // los animales cobran vida, no se colocan estáticos
     const obj = assetDefs[key].make();
     obj.rotation.y = Math.random() * Math.PI * 2;
     obj.updateMatrixWorld(true);
@@ -1389,15 +1572,16 @@ export async function create({ renderer }) {
     if (kind === 'asset') col = 0x7CFF9B;
     else if (kind === 'biome') col = key > 0 ? rgbHex(BIOMES[biomeKeys[key - 1]].color) : 0xff7a7a;
     ring.material.color.set(col);
-    const selId = kind === 'sculpt' ? 'sculpt' : kind[0] + ':' + key;
+    const selId = (kind === 'sculpt' || kind === 'nav') ? kind : kind[0] + ':' + key;
     paletteEl?.querySelectorAll('button').forEach((b) => b.classList.toggle('sel', b.dataset.id === selId));
   }
 
   const dom = renderer.domElement;
   const onMove = (ev) => {
     hovering = castToTerrain(ev);
-    ring.visible = hovering;
-    if (hovering) ring.position.set(hit.x, hit.y + 0.2, hit.z);
+    const showRing = hovering && selKind !== 'nav';   // en modo navegar no mostramos el pincel
+    ring.visible = showRing;
+    if (showRing) ring.position.set(hit.x, hit.y + 0.2, hit.z);
     if (sculpting && hovering) {
       if (selKind === 'biome') paintBiome(selKey);
       else if (selKind === 'sculpt') stroke();
@@ -1405,10 +1589,11 @@ export async function create({ renderer }) {
   };
   const onDown = (ev) => {
     if (ev.button !== 0) return;
+    if (selKind === 'nav') return;                    // modo navegar: el clic-izq no edita el terreno
     if (!castToTerrain(ev)) return;
     if (selKind === 'asset') placeAsset(selKey, hit.x, hit.y, hit.z);
     else if (selKind === 'biome') { sculpting = true; paintBiome(selKey); }
-    else { sculpting = true; flattenTarget = hit.y; stroke(); }
+    else if (selKind === 'sculpt') { sculpting = true; flattenTarget = hit.y; stroke(); }
   };
   const onUp = (ev) => { if (ev.button === 0) sculpting = false; };
   dom.addEventListener('pointermove', onMove);
@@ -1458,7 +1643,7 @@ export async function create({ renderer }) {
   function buildBird() {                       // ave: cuerpo (cono) + 2 alas planas que aletean
     const g = new THREE.Group();
     const body = new THREE.Mesh(new THREE.ConeGeometry(0.42, 2.4, 5), birdMat);
-    body.rotation.x = -Math.PI / 2;            // punta hacia +z (frente del vuelo)
+    body.rotation.x = Math.PI / 2;             // punta hacia +z (frente del vuelo)
     const wGeo = new THREE.PlaneGeometry(2.3, 1.0);
     const mkWing = (sign) => {
       const pivot = new THREE.Group();
@@ -1471,19 +1656,50 @@ export async function create({ renderer }) {
     g.add(body, lw, rw);
     return { g, lw, rw };
   }
-  function buildWhale() {                       // ballena: cuerpo (cápsula) + cola + soplido (oculto)
+  function buildWhale() {                       // ballena azul ~18 u: cuerpo afilado (lathe) + pectorales + dorsal + flukes + soplido
     const g = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(3.0, 12, 6, 12), whaleMat);
-    body.rotation.z = Math.PI / 2;             // largo a lo largo de x (frente +x)
-    body.scale.set(1, 0.78, 1);
-    const tail = new THREE.Group(); tail.position.x = -8.5;
-    const fl1 = new THREE.Mesh(new THREE.ConeGeometry(2.2, 0.5, 3), whaleMat);
-    fl1.rotation.x = Math.PI / 2; fl1.position.z = 2.0; fl1.scale.set(1, 1, 0.4);
-    const fl2 = fl1.clone(); fl2.position.z = -2.0; fl2.rotation.x = -Math.PI / 2;
-    tail.add(fl1, fl2);
-    const spout = new THREE.Group(); spout.position.set(5.5, 2.6, 0); spout.visible = false;
+    // --- CUERPO: perfil real revolucionado (cola fina → panza ancha → cabeza ancha y roma) ---
+    // pts = (radio, posición a lo largo del eje), de cola (-9) a morro (+8.95)
+    const profile = [
+      [0.05, -9.0], [0.55, -8.0], [0.75, -6.8],   // punta de cola + pedúnculo caudal fino
+      [1.15, -5.2], [1.85, -3.4], [2.50, -1.4],
+      [2.90,  0.6], [2.95,  2.4], [2.80,  3.9],     // panza (punto más ancho algo adelantado)
+      [2.45,  5.2], [1.90,  6.4], [1.15,  7.6],     // cabeza ancha
+      [0.40,  8.6], [0.05,  8.95],                  // morro romo cerrado
+    ].map(([r, y]) => new THREE.Vector2(r, y));
+    const bodyWrap = new THREE.Group();             // grupo para aplastar dorsoventralmente en mundo
+    const body = new THREE.Mesh(new THREE.LatheGeometry(profile, 16), whaleMat);
+    body.rotation.z = -Math.PI / 2;                 // eje del lathe (+y=morro) → +x (frente)
+    bodyWrap.add(body); bodyWrap.scale.set(1, 0.9, 1);
+    // --- ALETAS PECTORALES: largas, barridas hacia atrás y caídas (estilo ballena) ---
+    const mkPec = (sign) => {
+      const grp = new THREE.Group();
+      const m = new THREE.Mesh(new THREE.ConeGeometry(0.7, 2.6, 3), whaleMat);
+      m.scale.set(1, 1, 0.1); m.rotation.x = sign * Math.PI / 2;   // pala plana horizontal, punta hacia afuera
+      m.position.z = sign * 1.5;
+      grp.add(m); grp.position.set(2.2, -0.5, 0);
+      grp.rotation.y = -sign * 0.5;                 // barrido hacia atrás
+      grp.rotation.x = sign * 0.15;                 // ligera caída
+      return grp;
+    };
+    // --- ALETA DORSAL: pequeña, atrás (la azul la tiene diminuta) ---
+    const dorsal = new THREE.Mesh(new THREE.ConeGeometry(0.7, 1.4, 3), whaleMat);
+    dorsal.position.set(-3.2, 2.3, 0); dorsal.rotation.z = -0.5; dorsal.scale.set(0.9, 1, 0.13);
+    // --- COLA: flukes horizontales barridos, con muesca central ---
+    const tail = new THREE.Group(); tail.position.x = -8.4;
+    const mkFluke = (sign) => {
+      const grp = new THREE.Group();
+      const m = new THREE.Mesh(new THREE.ConeGeometry(1.3, 2.6, 3), whaleMat);
+      m.scale.set(1, 1, 0.12); m.rotation.x = sign * Math.PI / 2;  // pala plana horizontal, punta hacia afuera
+      m.position.z = sign * 1.5;                    // deja una muesca en el centro
+      grp.add(m); grp.rotation.y = -sign * 0.4;     // barrido hacia atrás
+      return grp;
+    };
+    tail.add(mkFluke(1), mkFluke(-1));
+    // --- SOPLIDO (oculto, sale al respirar) ---
+    const spout = new THREE.Group(); spout.position.set(5.2, 1.9, 0); spout.visible = false;
     for (let s = 0; s < 3; s++) { const p = new THREE.Mesh(new THREE.SphereGeometry(0.8, 6, 5), spoutMat); p.position.y = s * 1.4; spout.add(p); }
-    g.add(body, tail, spout);
+    g.add(bodyWrap, mkPec(1), mkPec(-1), dorsal, tail, spout);
     return { g, tail, spout };
   }
   function buildFish(mat) {                     // pez: cuerpo elipsoide + cola (frente +x)
@@ -1536,6 +1752,18 @@ export async function create({ renderer }) {
       arr.length = 0;
     }
   }
+  // devuelve un radio de órbita (≥ r0) cuyo anillo cae casi todo en AGUA (evita que la fauna marina
+  // patrulle embebida en la isla). Empuja el radio hacia afuera hasta encontrar mar abierto.
+  function waterRingRadius(r0) {
+    let r = r0;
+    for (let step = 0; step < 14; step++) {
+      let land = 0;
+      for (let a = 0; a < 8; a++) { const an = a / 8 * TWO_PI; if (heightAt(Math.cos(an) * r, Math.sin(an) * r) > -1) land++; }
+      if (land <= 2) return r;
+      r += SIZE * 0.06;
+    }
+    return r;
+  }
   function spawnFauna() {
     clearFauna();
     // --- AVES: bandada en círculos sobre la isla, a distintas alturas/radios ---
@@ -1558,36 +1786,36 @@ export async function create({ renderer }) {
       const w = buildWhale(); w.g.scale.setScalar(1.0 + Math.random() * 0.6); w.g.visible = false;
       faunaGroup.add(w.g);
       whales.push(Object.assign(w, {
-        R: SIZE * (0.30 + Math.random() * 0.08), ang: Math.random() * 6.283,
+        R: waterRingRadius(SIZE * (0.30 + Math.random() * 0.08)), ang: Math.random() * 6.283,
         spd: (0.02 + Math.random() * 0.02) * (Math.random() < 0.5 ? -1 : 1),
         state: 'wait', timer: 2 + Math.random() * 6, swimLeft: 0, spoutT: 0, spoutScale: 0,
       }));
     }
     // --- TIBURONES: BAJA probabilidad; patrullan cerca de la superficie con la aleta dorsal cortando el agua ---
     // ~5 m (great white real 4.6-6 m): cuerpo casi sumergido, solo lomo+aleta asoman
-    const nS = Math.random() < 0.30 ? (1 + (Math.random() < 0.25 ? 1 : 0)) : 0;
+    const nS = Math.random() < 0.75 ? (1 + (Math.random() < 0.4 ? 1 : 0)) : 0;   // suelen verse 1-2
     for (let k = 0; k < nS; k++) {
       const s = buildShark(); s.g.scale.setScalar(0.9 + Math.random() * 0.25);
       faunaGroup.add(s.g);
       sharks.push(Object.assign(s, {
-        R: SIZE * (0.16 + Math.random() * 0.24), ang: Math.random() * 6.283,
+        R: waterRingRadius(SIZE * (0.28 + Math.random() * 0.14)), ang: Math.random() * 6.283,   // patrulla en mar abierto
         spd: (0.05 + Math.random() * 0.05) * (Math.random() < 0.5 ? -1 : 1),
         ph: Math.random() * 6.283,
       }));
     }
     // --- DELFINES: BAJA probabilidad; manada que avanza haciendo arcos (porpoising) ---
     // ~3 m (bottlenose real 2.4-3.7 m)
-    if (Math.random() < 0.30) {
-      const cx = (Math.random() - 0.5) * SIZE * 0.4, cz = (Math.random() - 0.5) * SIZE * 0.4;
-      const Rpod = SIZE * (0.22 + Math.random() * 0.12), ang0 = Math.random() * 6.283;
+    if (Math.random() < 0.85) {                          // manada casi siempre presente
+      const Rpod = waterRingRadius(SIZE * (0.24 + Math.random() * 0.12));   // circula la isla en mar abierto
+      const ang0 = Math.random() * 6.283;
       const dir = Math.random() < 0.5 ? -1 : 1, spd = (0.06 + Math.random() * 0.05) * dir;
-      const nD = 3 + (Math.random() * 4 | 0);
+      const nD = 4 + (Math.random() * 3 | 0);            // varios (4-6)
       for (let k = 0; k < nD; k++) {
         const d = buildDolphin(); d.g.scale.setScalar(0.85 + Math.random() * 0.35);
         faunaGroup.add(d.g);
         dolphins.push(Object.assign(d, {
-          cx, cz, R: Rpod + (Math.random() - 0.5) * 18, ang: ang0 + (Math.random() - 0.5) * 0.4,
-          spd, leapH: 1.6 + Math.random() * 1.0, ph: Math.random() * 6.283, leapRate: 1.3 + Math.random() * 0.5,
+          cx: 0, cz: 0, R: Rpod + (Math.random() - 0.5) * 24, ang: ang0 + (Math.random() - 0.5) * 0.5,   // manada compacta
+          spd, leapH: 1.8 + Math.random() * 1.1, ph: Math.random() * 6.283, leapRate: 1.3 + Math.random() * 0.5,
         }));
       }
     }
@@ -1615,6 +1843,35 @@ export async function create({ renderer }) {
       }
     }
   }
+  // Coloca un animal VIVO en (x,z): se integra a la fauna y se comporta según su tipo (no queda estático).
+  function spawnPlacedAnimal(key, x, y, z) {
+    const dir = Math.random() < 0.5 ? -1 : 1;
+    if (key === 'ave') {
+      const b = buildBird(); b.g.scale.setScalar(1.0 + Math.random() * 0.8); faunaGroup.add(b.g);
+      const groundY = Math.max(0, heightAt(x, z));
+      birds.push(Object.assign(b, { cx: x, cz: z, R: 22 + Math.random() * 40,
+        alt: groundY + 32 + Math.random() * 34, ang: Math.random() * 6.283,
+        spd: (0.12 + Math.random() * 0.12) * dir, ph: Math.random() * 6.283, flap: 7 + Math.random() * 3 }));
+    } else if (key === 'pez') {
+      const size = 0.2 + Math.random() * 0.12;
+      const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]); g.scale.setScalar(size); faunaGroup.add(g);
+      const surf = y > 0.5 ? y : 0;
+      fishes.push({ g, cx: x, cz: z, area: 7, surf, jumpH: 0.5 + size * 2.0, size,
+        state: 'wait', timer: Math.random() * 4, t: 0, dur: 0, jx: x, jz: z, dx: 1, dz: 0 });
+    } else if (key === 'delfin') {
+      const d = buildDolphin(); d.g.scale.setScalar(0.9 + Math.random() * 0.3); faunaGroup.add(d.g);
+      dolphins.push(Object.assign(d, { cx: x, cz: z, R: 22 + Math.random() * 28, ang: Math.random() * 6.283,
+        spd: (0.07 + Math.random() * 0.05) * dir, leapH: 1.8 + Math.random() * 1.0, ph: Math.random() * 6.283, leapRate: 1.3 + Math.random() * 0.5 }));
+    } else if (key === 'tiburon') {
+      const s = buildShark(); s.g.scale.setScalar(0.9 + Math.random() * 0.25); faunaGroup.add(s.g);
+      sharks.push(Object.assign(s, { cx: x, cz: z, R: 26 + Math.random() * 38, ang: Math.random() * 6.283,
+        spd: (0.06 + Math.random() * 0.05) * dir, ph: Math.random() * 6.283 }));
+    } else if (key === 'ballena') {
+      const w = buildWhale(); w.g.scale.setScalar(1.0 + Math.random() * 0.5); w.g.visible = true; faunaGroup.add(w.g);
+      whales.push(Object.assign(w, { cx: x, cz: z, R: 45 + Math.random() * 55, ang: Math.random() * 6.283,
+        spd: (0.03 + Math.random() * 0.02) * dir, state: 'swim', swimLeft: Infinity, spoutT: 2 + Math.random() * 4, spoutScale: 0, placed: true }));
+    }
+  }
   function updateFauna(dt) {
     faunaTime += dt; const t = faunaTime;
     for (const b of birds) {                    // aves: círculo + bobeo + aleteo
@@ -1629,7 +1886,7 @@ export async function create({ renderer }) {
         if (w.timer <= 0) { w.state = 'swim'; w.swimLeft = 5 + Math.random() * 6; w.g.visible = true; w.spoutT = 1 + Math.random() * 3; }
       } else {
         w.swimLeft -= dt * Math.abs(w.spd); w.ang += w.spd * dt;
-        const x = Math.cos(w.ang) * w.R, z = Math.sin(w.ang) * w.R, sgn = Math.sign(w.spd);
+        const x = (w.cx || 0) + Math.cos(w.ang) * w.R, z = (w.cz || 0) + Math.sin(w.ang) * w.R, sgn = Math.sign(w.spd);
         const dxdir = -Math.sin(w.ang) * sgn, dzdir = Math.cos(w.ang) * sgn;
         w.g.position.set(x, -0.9 + Math.sin(t * 0.5) * 0.4, z);   // lomo bien expuesto sobre la superficie
         w.g.rotation.y = Math.atan2(-dzdir, dxdir);
@@ -1637,12 +1894,13 @@ export async function create({ renderer }) {
         w.spoutT -= dt;
         if (w.spoutT <= 0) { w.spout.visible = true; w.spoutScale = 1.4; w.spoutT = 6 + Math.random() * 6; }
         if (w.spout.visible) { w.spoutScale -= dt * 1.1; if (w.spoutScale <= 0) w.spout.visible = false; else w.spout.scale.setScalar(0.4 + w.spoutScale); }
-        if (w.swimLeft <= 0 || heightAt(x, z) >= -2) { w.state = 'wait'; w.timer = 8 + Math.random() * 14; w.g.visible = false; w.spout.visible = false; }
+        // las ballenas colocadas a mano nadan en bucle (no terminan la pasada ni se ocultan)
+        if (!w.placed && (w.swimLeft <= 0 || heightAt(x, z) >= -2)) { w.state = 'wait'; w.timer = 8 + Math.random() * 14; w.g.visible = false; w.spout.visible = false; }
       }
     }
     for (const s of sharks) {                   // tiburones: patrullan en superficie, aleta dorsal cortando el agua
       s.ang += s.spd * dt; const sgn = Math.sign(s.spd);
-      const x = Math.cos(s.ang) * s.R, z = Math.sin(s.ang) * s.R;
+      const x = (s.cx || 0) + Math.cos(s.ang) * s.R, z = (s.cz || 0) + Math.sin(s.ang) * s.R;
       s.g.position.set(x, -0.3 + Math.sin(t * 0.8 + s.ph) * 0.1, z);   // lomo a ras → asoman aleta dorsal y dorso
       s.g.rotation.y = Math.atan2(-Math.cos(s.ang) * sgn, -Math.sin(s.ang) * sgn);
       s.g.rotation.z = Math.sin(t * 2.2 + s.ph) * 0.06;                  // leve coleo
@@ -1687,6 +1945,147 @@ export async function create({ renderer }) {
     }
   }
 
+  // ============ ESTACIONES + CLIMA LOCALIZADO + OLAS DE ORILLA ============
+  // ---- ESTACIONES: línea de nieve dinámica (solo se congelan las cimas) + tinte estacional del follaje ----
+  const SEASON_NAMES = ['🌸 Primavera', '☀️ Verano', '🍂 Otoño', '❄️ Invierno'];
+  const _foliageTint = new THREE.Color();
+  let _lastSnowRecolor = -1e9;
+  function seasonName() { return SEASON_NAMES[Math.min(3, Math.floor((((params.season % 1) + 1) % 1) * 4))]; }
+  function applySeasonVisuals() {
+    const s = ((params.season % 1) + 1) % 1;
+    const temp = Math.cos((s - 0.25) * TWO_PI);          // 1 en verano · -1 en invierno
+    const cold = (1 - temp) / 2;                         // 0 verano … 1 invierno
+    seasonSnowY = LAND_MAX * (0.82 - 0.42 * cold);       // línea de nieve: alta en verano (solo cima), baja en invierno
+    // tinte del follaje (multiplica el color por vértice): verano verde pleno, otoño ámbar, invierno apagado
+    let tr, tg, tb;
+    if (s < 0.25) { const k = s / 0.25; tr = 0.80 + 0.20 * k; tg = 0.95 + 0.05 * k; tb = 0.78 + 0.10 * k; }       // primavera → verano
+    else if (s < 0.50) { const k = (s - 0.25) / 0.25; tr = 1.00; tg = 1.00 - 0.28 * k; tb = 0.88 - 0.50 * k; }     // verano → otoño (amarillea)
+    else if (s < 0.75) { const k = (s - 0.50) / 0.25; tr = 1.00 - 0.28 * k; tg = 0.72 - 0.30 * k; tb = 0.38 - 0.05 * k; } // otoño → invierno (marrón apagado)
+    else { const k = (s - 0.75) / 0.25; tr = 0.72 + 0.08 * k; tg = 0.42 + 0.53 * k; tb = 0.33 + 0.45 * k; }        // invierno → primavera
+    _foliageTint.setRGB(tr, tg, tb);
+    plantMat.color.copy(_foliageTint);
+  }
+  function updateSeason(dt) {
+    if (params.seasonCycle) params.season = (params.season + dt / params.seasonSeconds) % 1;
+    applySeasonVisuals();
+    if (Math.abs(seasonSnowY - _lastSnowRecolor) > LAND_MAX * 0.015) { _lastSnowRecolor = seasonSnowY; recolorAll(); }  // recolorea solo si la nieve se movió
+  }
+
+  // ---- OLAS DE ORILLA: parches de espuma que lavan la arena en la línea de costa ----
+  const foamGroup = new THREE.Group(); scene.add(foamGroup);
+  const foamMat = new THREE.MeshBasicMaterial({ color: 0xeaf6ff, transparent: true, opacity: 0, depthWrite: false });
+  const foamPatches = [];
+  function clearFoam() { for (const f of foamPatches) { foamGroup.remove(f.m); f.m.geometry.dispose(); f.m.material.dispose(); } foamPatches.length = 0; }
+  function buildShoreFoam() {
+    clearFoam();
+    if (!relief) return;
+    const spots = findReliefSpots('orilla', 90).concat(findReliefSpots('playa', 40));
+    for (const p of spots) {
+      const sz = SIZE * (0.008 + Math.random() * 0.012);
+      const m = new THREE.Mesh(new THREE.CircleGeometry(sz, 10), foamMat.clone());
+      m.rotation.x = -Math.PI / 2; m.position.set(p.x, 0.12, p.z); m.renderOrder = 3;
+      foamGroup.add(m);
+      foamPatches.push({ m, ph: Math.random() * TWO_PI, rate: 0.7 + Math.random() * 0.6 });
+    }
+  }
+  function updateFoam(t) {
+    foamGroup.visible = params.shoreWaves;
+    if (!params.shoreWaves) return;
+    for (const f of foamPatches) {
+      const w = 0.5 + 0.5 * Math.sin(t * f.rate + f.ph);   // lavado entra/sale
+      f.m.material.opacity = 0.12 + 0.5 * w;
+      const s = 0.55 + 0.7 * w; f.m.scale.set(s, s, s);
+    }
+  }
+
+  // ---- CLIMA LOCALIZADO: celdas que cruzan el mapa con nubes/lluvia/niebla; a veces un tifón ----
+  const weatherGroup = new THREE.Group(); scene.add(weatherGroup);
+  const cloudGeo = new THREE.IcosahedronGeometry(1, 1);
+  const cloudMatLight = new THREE.MeshStandardMaterial({ color: 0xf4f7fc, roughness: 1, flatShading: true });
+  const cloudMatDark = new THREE.MeshStandardMaterial({ color: 0x717b8c, roughness: 1, flatShading: true });
+  const fogCanvas = document.createElement('canvas'); fogCanvas.width = fogCanvas.height = 64;
+  const fctx = fogCanvas.getContext('2d');
+  const fgr = fctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  fgr.addColorStop(0, 'rgba(222,227,236,0.75)'); fgr.addColorStop(1, 'rgba(222,227,236,0)');
+  fctx.fillStyle = fgr; fctx.fillRect(0, 0, 64, 64);
+  const fogTex = new THREE.CanvasTexture(fogCanvas);
+  const weatherCells = [];
+  let weatherInited = false, windX = 1, windZ = 0, windSpeed = 10;
+  function makeCell() { const g = new THREE.Group(); weatherGroup.add(g); const c = { g, type: 'cloud', x: 0, z: 0, r: 1, puffs: [], rain: null, rainTop: 0, fogs: [], typhoon: false, alpha: 0 }; weatherCells.push(c); return c; }
+  function dressCell(cell) {                              // (re)construye los visuales según tipo/tamaño
+    for (const p of cell.puffs) cell.g.remove(p); cell.puffs.length = 0;
+    for (const f of cell.fogs) { cell.g.remove(f); f.material.dispose(); } cell.fogs.length = 0;
+    if (cell.rain) { cell.g.remove(cell.rain); cell.rain.geometry.dispose(); cell.rain.material.dispose(); cell.rain = null; }
+    const r = cell.r, wet = cell.type === 'rain' || cell.typhoon;
+    const cloudY = Math.max(LAND_MAX * 1.6, SIZE * 0.18);
+    cell.rainTop = cloudY;
+    if (cell.type !== 'fog') {                            // nubes (claras o de tormenta)
+      const mat = wet ? cloudMatDark : cloudMatLight;
+      const nP = cell.typhoon ? 18 : (5 + (Math.random() * 5 | 0));
+      for (let i = 0; i < nP; i++) {
+        const m = new THREE.Mesh(cloudGeo, mat);
+        if (cell.typhoon) { const a = i / nP * TWO_PI * 2.2, rr = r * (0.12 + 0.85 * i / nP); m.position.set(Math.cos(a) * rr, cloudY + (Math.random() - 0.5) * r * 0.1, Math.sin(a) * rr); }
+        else m.position.set((Math.random() - 0.5) * r * 1.4, cloudY + (Math.random() - 0.5) * r * 0.2, (Math.random() - 0.5) * r * 1.4);
+        const sc = r * (0.16 + Math.random() * 0.18); m.scale.set(sc * 1.6, sc * 0.8, sc * 1.6);
+        cell.g.add(m); cell.puffs.push(m);
+      }
+    }
+    if (wet) {                                            // lluvia: Points dentro del cilindro de la celda
+      const n = cell.typhoon ? 1400 : 700, pos = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { const a = Math.random() * TWO_PI, rr = Math.sqrt(Math.random()) * r; pos[i * 3] = Math.cos(a) * rr; pos[i * 3 + 1] = Math.random() * cloudY; pos[i * 3 + 2] = Math.sin(a) * rr; }
+      const gge = new THREE.BufferGeometry(); gge.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const rmat = new THREE.PointsMaterial({ color: cell.typhoon ? 0x8fa0b8 : 0xaebfd6, size: cell.typhoon ? 3 : 2.2, sizeAttenuation: false, transparent: true, opacity: 0.5, depthWrite: false });
+      cell.rain = new THREE.Points(gge, rmat); cell.g.add(cell.rain);
+    }
+    if (cell.type === 'fog') {                            // niebla a ras de suelo
+      const nF = 5 + (Math.random() * 4 | 0);
+      for (let i = 0; i < nF; i++) {
+        const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fogTex, transparent: true, opacity: 0, depthWrite: false }));
+        s.position.set((Math.random() - 0.5) * r * 1.6, LAND_MAX * 0.08 + Math.random() * LAND_MAX * 0.1, (Math.random() - 0.5) * r * 1.6);
+        const sc = r * (0.8 + Math.random() * 0.8); s.scale.set(sc, sc * 0.5, 1);
+        cell.g.add(s); cell.fogs.push(s);
+      }
+    }
+  }
+  function recycleCell(cell, firstTime) {
+    const a = params.weatherAmount, roll = Math.random();
+    cell.typhoon = !firstTime && Math.random() < 0.05 * a;            // tifón ocasional
+    cell.type = cell.typhoon ? 'rain' : (roll < 0.45 ? 'cloud' : roll < 0.45 + 0.35 * a ? 'rain' : 'fog');
+    cell.r = cell.typhoon ? SIZE * 0.42 : SIZE * (0.14 + Math.random() * 0.16);
+    const edge = SIZE * 1.0;
+    cell.x = -windX * edge + (Math.random() - 0.5) * SIZE; cell.z = -windZ * edge + (Math.random() - 0.5) * SIZE;
+    cell.alpha = 0;
+    dressCell(cell);
+  }
+  function initWeather() {
+    weatherInited = true;
+    const ang = Math.random() * TWO_PI; windX = Math.cos(ang); windZ = Math.sin(ang); windSpeed = SIZE * (0.01 + Math.random() * 0.02);
+    for (let i = 0; i < 8; i++) { const c = makeCell(); recycleCell(c, true); c.x = (Math.random() - 0.5) * SIZE * 1.6; c.z = (Math.random() - 0.5) * SIZE * 1.6; c.alpha = 1; c.g.position.set(c.x, 0, c.z); }
+  }
+  function updateWeather(dt, t) {
+    weatherGroup.visible = params.weather;
+    if (!params.weather) return;
+    if (!weatherInited) initWeather();
+    const want = Math.round(2 + params.weatherAmount * 6);
+    for (let i = 0; i < weatherCells.length; i++) {
+      const cell = weatherCells[i], active = i < want;
+      cell.g.visible = active;
+      if (!active) continue;
+      cell.x += windX * windSpeed * dt; cell.z += windZ * windSpeed * dt;
+      cell.alpha = Math.min(1, cell.alpha + dt * 0.3);
+      cell.g.position.set(cell.x, 0, cell.z);
+      if (cell.typhoon) cell.g.rotation.y += dt * 0.25;             // remolino del tifón
+      if (cell.rain) {
+        const arr = cell.rain.geometry.attributes.position.array, fall = (cell.typhoon ? 90 : 60) * dt * (SIZE / 600);
+        for (let k = 1; k < arr.length; k += 3) { arr[k] -= fall; if (arr[k] < 0) arr[k] = cell.rainTop; }
+        cell.rain.geometry.attributes.position.needsUpdate = true;
+        cell.rain.material.opacity = 0.5 * cell.alpha;
+      }
+      for (const f of cell.fogs) f.material.opacity = 0.5 * cell.alpha * (0.7 + 0.3 * Math.sin(t * 0.5 + f.position.x));
+      if (Math.hypot(cell.x, cell.z) > SIZE * 1.35 && (cell.x * windX + cell.z * windZ) > 0) recycleCell(cell, false);  // cruzó → recicla
+    }
+  }
+
   // ---- guardar / cargar isla (persistencia por semilla en localStorage) ----
   let toastEl = null, toastTimer = 0;
   function toast(msg) {
@@ -1709,10 +2108,14 @@ export async function create({ renderer }) {
     try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); toast('Isla guardada ✓'); }
     catch (e) { toast('No se pudo guardar'); }
   }
-  function loadIsland(quiet) {
-    let data = null;
-    try { data = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null'); } catch (e) { data = null; }
-    if (!data || typeof data.seed !== 'number') { if (!quiet) toast('No hay isla guardada'); return false; }
+  // datos mínimos para reconstruir EXACTAMENTE la isla actual (semilla + ajustes de generación)
+  function currentIslandData() {
+    return { seed: currentSeed, sizeKm: params.sizeKm, coverage: params.coverage, erosion: params.erosion,
+      rivers: params.rivers, lakes: params.lakes, vegDensity: params.vegDensity };
+  }
+  // reconstruye una isla a partir de sus datos guardados
+  function applyIslandData(data, quiet) {
+    if (!data || typeof data.seed !== 'number') { if (!quiet) toast('Datos inválidos'); return false; }
     params.sizeKm = data.sizeKm ?? params.sizeKm;
     params.coverage = data.coverage ?? params.coverage;
     params.erosion = data.erosion ?? params.erosion;
@@ -1724,9 +2127,41 @@ export async function create({ renderer }) {
     buildTerrainMesh(data.seed >>> 0);
     applySizeToView();
     if (gui) gui.controllersRecursive().forEach((c) => c.updateDisplay());
-    if (!quiet) toast('Isla cargada ✓');
     return true;
   }
+  function loadIsland(quiet) {
+    let data = null;
+    try { data = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null'); } catch (e) { data = null; }
+    if (!data || typeof data.seed !== 'number') { if (!quiet) toast('No hay isla guardada'); return false; }
+    const ok = applyIslandData(data, quiet);
+    if (ok && !quiet) toast('Isla cargada ✓');
+    return ok;
+  }
+  // ---- biblioteca: varios mapas con nombre (semilla + ajustes) ----
+  function readLib() { try { return JSON.parse(localStorage.getItem(LIB_KEY) || '[]') || []; } catch (e) { return []; } }
+  function writeLib(arr) { try { localStorage.setItem(LIB_KEY, JSON.stringify(arr)); return true; } catch (e) { return false; } }
+  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function saveNamedIsland() {
+    if (currentSeed == null) { toast('Genera una isla primero'); return; }
+    const lib = readLib();
+    const name = (prompt('Nombre del mapa:', 'Isla ' + (lib.length + 1)) || '').trim();
+    if (!name) return;
+    lib.push(Object.assign({ name, ts: Date.now() }, currentIslandData()));
+    if (writeLib(lib)) { toast('Guardado en biblioteca ✓'); refreshLibPanel(); } else toast('No se pudo guardar');
+  }
+  function refreshLibPanel() {
+    if (!libEl) return;
+    const lib = readLib();
+    let html = '<div class="ap-head"><span>Mis mapas</span><button id="lib-close" title="Cerrar">✕</button></div><div id="lib-body">';
+    if (!lib.length) html += '<div class="hintline">Aún no guardaste mapas.<br>Usa “💾 Guardar como…”.</div>';
+    lib.forEach((m, i) => {
+      html += `<div class="lib-item"><span class="lib-name" title="semilla ${m.seed} · ${m.sizeKm} km">${escapeHtml(m.name)}</span>` +
+        `<span class="lib-actions"><button data-load="${i}" title="Cargar">📂</button>` +
+        `<button data-del="${i}" title="Borrar">🗑️</button></span></div>`;
+    });
+    libEl.innerHTML = html + '</div>';
+  }
+  function openLibrary() { refreshLibPanel(); libEl.style.display = 'block'; }
 
   // ---- GUI ----
   const gui = new GUI({ title: 'Mundo 3 · Constructor' });
@@ -1742,18 +2177,151 @@ export async function create({ renderer }) {
   gui.add(params, 'vegDensity', 0.2, 4, 0.1).name('Densidad vegetación');
   gui.add(params, 'vegDist', 200, 3000, 50).name('Distancia veg. (m)').onChange(() => { instDirty = true; });
   gui.add({ gen: generateRandom }, 'gen').name('🎲 Generar isla aleatoria');
-  gui.add({ save: saveIsland }, 'save').name('💾 Guardar isla');
-  gui.add({ load: () => loadIsland(false) }, 'load').name('📂 Cargar isla');
+  gui.add({ save: saveIsland }, 'save').name('💾 Guardar isla (rápido)');
+  gui.add({ load: () => loadIsland(false) }, 'load').name('📂 Cargar isla (rápido)');
+  gui.add({ saveAs: saveNamedIsland }, 'saveAs').name('💾 Guardar como…');
+  gui.add({ lib: openLibrary }, 'lib').name('📚 Mis mapas');
   gui.add({ sow: scatterAssets }, 'sow').name('🌱 Sembrar assets');
   gui.add({ clr: clearPlaced }, 'clr').name('🧹 Limpiar assets');
   gui.add({ plano: flat }, 'plano').name('Vaciar a mar');
   gui.add(params, 'mar').name('Mostrar mar').onChange((v) => { water.visible = v; });
   gui.add(params, 'wireframe').name('Malla').onChange((v) => { mesh.material.wireframe = v; });
+  gui.add(params, 'heatmap').name('🗺️ Relieve (heatmap)').onChange((v) => { recolorAll(); legendEl.style.display = v ? 'block' : 'none'; });
+  gui.add({ cine: toggleCinematic }, 'cine').name('🎬 Cinemática (grabar)');
+  const fDN = gui.addFolder('Día / Noche');
+  const timeCtrl = fDN.add(params, 'timeOfDay', 0, 24, 0.01).name('Hora').onChange(updateSky);
+  fDN.add(params, 'daySeconds', 10, 600, 5).name('Duración del día (s)');
+  fDN.add(params, 'dayCycle').name('Ciclo automático');
+  const moonCtrl = fDN.add(params, 'moonPhase', 0, 1, 0.001).name('Fase lunar').onChange(updateSky);
+  fDN.add(params, 'moonCycle').name('Avanzar fases');
+  fDN.open();
+  const fCL = gui.addFolder('Clima / Estaciones');
+  const seasonCtrl = fCL.add(params, 'season', 0, 1, 0.001).name('Estación').onChange(() => { applySeasonVisuals(); recolorAll(); });
+  fCL.add(params, 'seasonCycle').name('Ciclo de estaciones');
+  fCL.add(params, 'seasonSeconds', 30, 1200, 10).name('Duración del año (s)');
+  fCL.add(params, 'weather').name('Clima localizado');
+  fCL.add(params, 'weatherAmount', 0, 1, 0.05).name('Nubosidad');
+  fCL.add(params, 'shoreWaves').name('Olas de orilla');
+  fCL.open();
+
+  // reloj + nombre de la fase lunar en pantalla
+  const clockEl = document.createElement('div');
+  clockEl.id = 'daynight-hud';
+  clockEl.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:24;' +
+    'font-family:system-ui,sans-serif;font-size:13px;color:#dfe9ff;background:rgba(10,16,28,.6);' +
+    'border:1px solid rgba(160,190,255,.25);border-radius:10px;padding:6px 14px;backdrop-filter:blur(6px);' +
+    'pointer-events:none;letter-spacing:.3px;';
+  document.body.appendChild(clockEl);
+  const PHASE_NAMES = ['🌑 Luna nueva', '🌒 Creciente', '🌓 Cuarto creciente', '🌔 Gibosa creciente',
+    '🌕 Luna llena', '🌖 Gibosa menguante', '🌗 Cuarto menguante', '🌘 Menguante'];
+  function updateClockHud() {
+    const hf = params.timeOfDay, h = hf | 0, m = (hf - h) * 60 | 0;
+    const phase = PHASE_NAMES[Math.round(params.moonPhase * 8) % 8];
+    clockEl.textContent = `🕑 ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}  ·  ${phase}  ·  ${seasonName()}`;
+  }
+
+  // leyenda del heatmap de relieve (se muestra solo con la vista activa)
+  const legendEl = document.createElement('div');
+  legendEl.id = 'relief-legend';
+  legendEl.style.cssText = 'position:fixed;bottom:16px;left:16px;z-index:24;display:none;' +
+    'font-family:system-ui,sans-serif;font-size:12px;color:#e7eefc;background:rgba(10,16,28,.7);' +
+    'border:1px solid rgba(160,190,255,.25);border-radius:10px;padding:8px 12px;backdrop-filter:blur(6px);';
+  legendEl.innerHTML = '<div style="opacity:.7;margin-bottom:5px;letter-spacing:.5px;">RELIEVE</div>' +
+    RELIEF_CLASSES.map((name, k) => {
+      const c = RELIEF_COLORS[k];
+      return `<div style="display:flex;align-items:center;gap:7px;margin:2px 0;">` +
+        `<span style="width:13px;height:13px;border-radius:3px;background:rgb(${c[0]},${c[1]},${c[2]});"></span>${name}</div>`;
+    }).join('');
+  document.body.appendChild(legendEl);
+
+  // ===== CINEMÁTICA: recorrido automático en 16:9 1080p para grabar (oculta toda la UI) =====
+  let cinematic = false, cineT = 0, cineHintT = 0;
+  const _cineSaved = {};
+  const _camGoal = new THREE.Vector3(), _camLook = new THREE.Vector3();
+  const cineHint = document.createElement('div');
+  cineHint.id = 'cine-hint';
+  cineHint.style.cssText = 'position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:60;display:none;' +
+    'font-family:system-ui,sans-serif;font-size:13px;color:#fff;background:rgba(0,0,0,.45);' +
+    'border-radius:20px;padding:7px 18px;backdrop-filter:blur(4px);transition:opacity .8s;pointer-events:none;';
+  cineHint.textContent = '🎬 Cinemática · Esc para salir · C para alternar';
+  document.body.appendChild(cineHint);
+  function fitLetterbox() {                            // encaja el canvas 16:9 centrado con barras negras
+    const cv = renderer.domElement, aspect = 16 / 9;
+    let w = innerWidth, ht = innerWidth / aspect;
+    if (ht > innerHeight) { ht = innerHeight; w = innerHeight * aspect; }
+    cv.style.position = 'fixed';
+    cv.style.width = w + 'px'; cv.style.height = ht + 'px';
+    cv.style.left = ((innerWidth - w) / 2) + 'px';
+    cv.style.top = ((innerHeight - ht) / 2) + 'px';
+  }
+  function enterCinematic() {
+    if (cinematic) return;
+    cinematic = true; cineT = 0; cineHintT = 3.5;
+    _cineSaved.cam = camera.position.clone();
+    _cineSaved.target = controls.target.clone();
+    _cineSaved.aspect = camera.aspect;
+    _cineSaved.cv = renderer.domElement.style.cssText;
+    _cineSaved.bg = document.body.style.background;
+    _cineSaved.dpr = renderer.getPixelRatio();
+    controls.enabled = false;
+    if (paletteEl) paletteEl.style.display = 'none';
+    gui.hide(); clockEl.style.display = 'none'; legendEl.style.display = 'none';
+    if (libEl) libEl.style.display = 'none';
+    ring.visible = false;
+    const back = document.getElementById('back'); if (back) back.style.display = 'none';
+    const hintEl = document.getElementById('hint'); if (hintEl) hintEl.style.display = 'none';
+    document.body.style.background = '#000';
+    renderer.setPixelRatio(1);                         // buffer interno exacto 1920x1080
+    renderer.setSize(1920, 1080, false);
+    camera.aspect = 16 / 9; camera.updateProjectionMatrix();
+    fitLetterbox();
+    cineHint.style.display = 'block'; cineHint.style.opacity = '1';
+  }
+  function exitCinematic() {
+    if (!cinematic) return;
+    cinematic = false;
+    controls.enabled = true;
+    if (paletteEl) paletteEl.style.display = '';
+    gui.show(); clockEl.style.display = '';
+    legendEl.style.display = params.heatmap ? 'block' : 'none';
+    const back = document.getElementById('back'); if (back) back.style.display = 'block';
+    document.body.style.background = _cineSaved.bg || '';
+    renderer.domElement.style.cssText = _cineSaved.cv || '';
+    renderer.setPixelRatio(_cineSaved.dpr || 1);
+    renderer.setSize(innerWidth, innerHeight, true);
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    camera.position.copy(_cineSaved.cam);
+    controls.target.copy(_cineSaved.target);
+    controls.update();
+    cineHint.style.display = 'none';
+  }
+  function toggleCinematic() { cinematic ? exitCinematic() : enterCinematic(); }
+  function cineUpdate(dt) {                            // autopiloto: órbita lenta con dolly y subidas/bajadas
+    cineT += dt; const t = cineT, SZ = SIZE || 1000;
+    const peak = Math.max(LAND_MAX, SZ * 0.12);
+    const az = t * 0.10;
+    const radius = SZ * (0.72 + 0.30 * Math.sin(t * 0.045));   // se acerca y se aleja
+    const elev = SZ * (0.16 + 0.26 * (0.5 + 0.5 * Math.sin(t * 0.07 + 1.0)));   // sube y baja
+    const cx = Math.cos(az) * radius, cz = Math.sin(az) * radius;
+    _camGoal.set(cx, elev, cz);
+    const gy = Math.max(0, heightAt(cx, cz)) + SZ * 0.02 + 4;  // nunca atraviesa el terreno
+    if (_camGoal.y < gy) _camGoal.y = gy;
+    camera.position.lerp(_camGoal, 1 - Math.pow(0.0015, dt));  // suavizado independiente de fps
+    _camLook.set(Math.sin(t * 0.06) * SZ * 0.10, peak * 0.32, Math.cos(t * 0.08) * SZ * 0.10);
+    camera.lookAt(_camLook);
+    if (cineHintT > 0) { cineHintT -= dt; if (cineHintT <= 0) cineHint.style.opacity = '0'; }
+  }
+  const onCineKey = (e) => {
+    if (e.code === 'Escape' && cinematic) { exitCinematic(); e.stopImmediatePropagation(); }
+    else if (e.code === 'KeyC' && !/input|textarea/i.test((e.target && e.target.tagName) || '')) toggleCinematic();
+  };
+  addEventListener('keydown', onCineKey, true);        // captura → corre antes del Esc del shell
 
   // init: si hay una isla guardada, se recrea idéntica; si no, una aleatoria nueva
   configureForSize();
   if (!loadIsland(true)) buildTerrainMesh();
   applySizeToView();
+  updateSky(); updateClockHud();
 
   // ---- panel de assets ----
   const style = document.createElement('style');
@@ -1773,57 +2341,134 @@ export async function create({ renderer }) {
     #asset-palette button:hover { background: rgba(60,90,150,.6); }
     #asset-palette button.sel { border-color: #7CFF9B; background: rgba(50,100,70,.6); }
     #asset-palette .hintline { color: #9fb4d4; font-size: 11px; margin: 8px 4px 2px; line-height: 1.35; }
+    #asset-palette .ap-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: -2px 0 6px; }
+    #asset-palette .ap-head span { color: #cfe0ff; font-size: 12px; letter-spacing: .5px; text-transform: uppercase; opacity: .85; font-weight: 600; }
+    #asset-palette #ap-toggle { width: 28px; flex: 0 0 auto; margin: 0; padding: 3px 0; text-align: center; font-size: 13px; }
+    #asset-palette.collapsed { width: auto; }
+    #asset-palette.collapsed #ap-body { display: none; }
+    #asset-palette .sec-h { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+    #asset-palette .sec-arrow { font-size: 9px; opacity: .65; width: 9px; flex: 0 0 auto; }
+    #asset-palette .sec.collapsed .sec-c { display: none; }
+    #map-library { position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 30; width: 280px;
+      max-height: calc(100vh - 120px); overflow-y: auto; display: none;
+      background: rgba(10,16,28,.85); border: 1px solid rgba(160,190,255,.3); border-radius: 12px;
+      padding: 12px; backdrop-filter: blur(8px); font-family: system-ui, sans-serif; color: #e7eefc; }
+    #map-library .ap-head span { color: #cfe0ff; font-size: 13px; letter-spacing: .5px; text-transform: uppercase; opacity: .85; font-weight: 600; }
+    #map-library #lib-close { width: 30px; padding: 3px 0; margin: 0; cursor: pointer; text-align: center;
+      background: rgba(40,60,95,.5); color: #e7eefc; border: 1px solid transparent; border-radius: 8px; }
+    #map-library .ap-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    #map-library .lib-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: rgba(40,60,95,.4); border-radius: 8px; padding: 7px 10px; margin: 5px 0; }
+    #map-library .lib-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #map-library .lib-actions { flex: 0 0 auto; display: flex; gap: 4px; }
+    #map-library .lib-actions button { cursor: pointer; background: rgba(60,90,150,.5); color: #e7eefc;
+      border: 1px solid transparent; border-radius: 7px; padding: 5px 8px; font-size: 13px; }
+    #map-library .lib-actions button:hover { background: rgba(80,120,190,.7); }
+    #map-library .hintline { color: #9fb4d4; font-size: 12px; line-height: 1.4; }
   `;
   document.head.appendChild(style);
   paletteEl = document.createElement('div');
   paletteEl.id = 'asset-palette';
-  let h = '<h4>Herramienta</h4><button data-id="sculpt">✋ Esculpir</button>';
-  h += '<h4>Pintar bioma</h4>';
-  biomeKeys.forEach((k, n) => { h += `<button data-id="b:${n + 1}">${BIOMES[k].label}</button>`; });
-  h += '<button data-id="b:0">🧽 Borrar bioma</button>';
-  h += '<h4>Colocar asset</h4>';
+  // cada sección (h4/h5) es plegable: la cabecera con ▾/▸ colapsa su contenido
+  const sec = (title, lvl, inner) =>
+    `<div class="sec"><${lvl} class="sec-h"><span class="sec-arrow">▾</span>${title}</${lvl}><div class="sec-c">${inner}</div></div>`;
+  let h = '<div class="ap-head"><span>Paleta</span><button id="ap-toggle" title="Colapsar/expandir todo">▾</button></div><div id="ap-body">';
+  h += sec('Herramienta', 'h4', '<button data-id="nav">🧭 Navegar (no editar)</button><button data-id="sculpt">✋ Esculpir</button>');
+  let biomeBtns = biomeKeys.map((k, n) => `<button data-id="b:${n + 1}">${BIOMES[k].label}</button>`).join('');
+  biomeBtns += '<button data-id="b:0">🧽 Borrar bioma</button>';
+  h += sec('Pintar bioma', 'h4', biomeBtns);
+  let assetInner = '';
   for (const grp of assetGroups) {
-    h += `<h5>${grp.title}</h5>`;
-    for (const k of grp.keys) if (assetDefs[k]) h += `<button data-id="a:${k}">${assetDefs[k].label}</button>`;
+    let btns = '';
+    for (const k of grp.keys) if (assetDefs[k]) btns += `<button data-id="a:${k}">${assetDefs[k].label}</button>`;
+    assetInner += sec(grp.title, 'h5', btns);
   }
-  h += '<div class="hintline">Pinta biomas o coloca assets con clic-izquierdo sobre el terreno.</div>';
+  h += sec('Colocar asset', 'h4', assetInner);
+  h += '<div class="hintline">Elige una herramienta y usa clic-izquierdo sobre el terreno.</div></div>';
   paletteEl.innerHTML = h;
   document.body.appendChild(paletteEl);
   const onPaletteClick = (e) => {
+    const head = e.target.closest('.sec-h');          // clic en cabecera de sección → plega/expande
+    if (head) {
+      const sc = head.parentElement.classList.toggle('collapsed');
+      const ar = head.querySelector('.sec-arrow'); if (ar) ar.textContent = sc ? '▸' : '▾';
+      return;
+    }
     const b = e.target.closest('button'); if (!b) return;
+    if (b.id === 'ap-toggle') {                        // colapsar/expandir toda la paleta
+      const col = paletteEl.classList.toggle('collapsed');
+      b.textContent = col ? '▸' : '▾';
+      return;
+    }
     const id = b.dataset.id;
-    if (id === 'sculpt') setSel('sculpt', null);
+    if (id === 'nav') setSel('nav', null);
+    else if (id === 'sculpt') setSel('sculpt', null);
     else if (id.startsWith('b:')) setSel('biome', parseInt(id.slice(2), 10));
     else if (id.startsWith('a:')) setSel('asset', id.slice(2));
   };
   paletteEl.addEventListener('click', onPaletteClick);
-  setSel('sculpt', null);
+  setSel('nav', null);
+
+  // panel de biblioteca de mapas guardados
+  const libEl = document.createElement('div');
+  libEl.id = 'map-library';
+  document.body.appendChild(libEl);
+  libEl.addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.id === 'lib-close') { libEl.style.display = 'none'; return; }
+    if (b.dataset.load != null) {
+      const m = readLib()[+b.dataset.load];
+      if (m && applyIslandData(m, false)) { toast('“' + m.name + '” cargado ✓'); libEl.style.display = 'none'; }
+      return;
+    }
+    if (b.dataset.del != null) {
+      const lib = readLib(), m = lib[+b.dataset.del];
+      if (m && confirm('¿Borrar “' + m.name + '”?')) { lib.splice(+b.dataset.del, 1); writeLib(lib); refreshLibPanel(); }
+    }
+  });
 
   return {
     scene, camera, showHud: false,
+    terrainClassAt, findReliefSpots,   // API de geomorfología (p.ej. fauna que anida en 'acantilado')
     hint: 'Tamaño del mapa en el panel · clic-izq esculpe/coloca · clic-DER orbita · arrastrar rueda mueve · girar rueda zoom',
     update(dt) {
+      if (params.dayCycle) { params.timeOfDay = (params.timeOfDay + dt * 24 / params.daySeconds) % 24; timeCtrl.updateDisplay(); }
+      if (params.moonCycle) { params.moonPhase = (params.moonPhase + dt / (params.daySeconds * 29.5)) % 1; moonCtrl.updateDisplay(); }
+      if (params.seasonCycle) seasonCtrl.updateDisplay();
+      updateSky(); updateClockHud();
       water.material.uniforms.time.value += dt * 0.5;
       for (const lk of lakeWaters) lk.material.uniforms.time.value += dt * 0.4;
       riverNormals.offset.y -= dt * 0.25;   // desplaza el normal map río abajo → fluye
       riverNormals.offset.x = Math.sin(riverNormals.offset.y * 2) * 0.02;
       if (normalsDirty) { geo.computeVertexNormals(); normalsDirty = false; }  // 1 vez por frame
       updateFauna(dt);   // aves volando, ballenas cada tanto, peces saltando
-      controls.update();
+      updateSeason(dt);  // avance de estaciones: nieve dinámica + tinte del follaje
+      updateFoam(faunaTime);          // olas rompiendo en la orilla
+      updateWeather(dt, faunaTime);   // nubes/lluvia/niebla/tifón por zonas
+      if (cinematic) cineUpdate(dt); else controls.update();
       cullInstances();   // recompone vegetación visible (frustum + distancia + LOD) si la cámara se movió
       // la cámara no atraviesa el terreno ni baja del agua
       const gy = Math.max(0, heightAt(camera.position.x, camera.position.z));
       const minY = gy + 1.5;
       if (camera.position.y < minY) camera.position.y = minY;
     },
-    onResize(w, ht) { camera.aspect = w / ht; camera.updateProjectionMatrix(); },
+    onResize(w, ht) {
+      if (cinematic) { renderer.setSize(1920, 1080, false); camera.aspect = 16 / 9; camera.updateProjectionMatrix(); fitLetterbox(); }
+      else { camera.aspect = w / ht; camera.updateProjectionMatrix(); }
+    },
     dispose() {
+      if (cinematic) exitCinematic();   // restaura renderer/canvas antes de salir del mundo
+      removeEventListener('keydown', onCineKey, true);
+      cineHint?.remove();
       gui.destroy();
       controls.dispose();
       dom.removeEventListener('pointermove', onMove);
       dom.removeEventListener('pointerdown', onDown);
       removeEventListener('pointerup', onUp);
       paletteEl?.remove();
+      clockEl?.remove();
+      legendEl?.remove();
+      libEl?.remove();
       style.remove();
       scene.traverse((o) => {
         if (o.geometry) o.geometry.dispose?.();
