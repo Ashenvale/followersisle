@@ -2938,11 +2938,21 @@ export async function create({ renderer, mode }) {
       `<button style="${bs}" data-z="1">🏠 Residencia</button><button style="${bs}" data-z="2">🛠️ Servicios</button>` +
       `<button style="${bs}" data-z="0">🧽 Borrar</button><button style="${bs}" data-z="nav">✋ Mover</button>` +
       `<label style="margin-left:4px;"><input type="checkbox" id="ct-show" checked> ver zonas</label>` +
-      `<span style="margin-left:6px;">Etapa</span><select id="ct-era" style="${bs}">` + eras.map((l, i) => `<option value="${i}"${i === (humanSys ? humanSys.getEra() : 0) ? ' selected' : ''}>${l}</option>`).join('') + '</select>';
+      `<span style="margin-left:6px;">Etapa</span><select id="ct-era" style="${bs}">` + eras.map((l, i) => `<option value="${i}"${i === (humanSys ? humanSys.getEra() : 0) ? ' selected' : ''}>${l}</option>`).join('') + '</select>' +
+      '<div id="ct-assets" style="width:100%;margin-top:2px;color:#b9c8e0;"></div>';
     document.body.appendChild(buildToolsEl);
+    const renderAssets = () => {
+      const el = buildToolsEl.querySelector('#ct-assets'); if (!el || !humanSys) return;
+      const list = humanSys.eraAssets();
+      el.innerHTML = list.length ? ('Permitir: ' + list.map((a) => `<label style="margin-right:8px;white-space:nowrap;"><input type="checkbox" data-a="${a.key}"${a.on ? ' checked' : ''}> ${a.label}</label>`).join('')) : '<i>elegí una etapa para permitir construcciones</i>';
+    };
     buildToolsEl.addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; const z = b.dataset.z; if (z === 'nav') setSel('nav', null); else setSel('zone', +z); });
-    buildToolsEl.querySelector('#ct-show').addEventListener('change', (e) => { params.showZones = e.target.checked; recolorAll(); });
-    buildToolsEl.querySelector('#ct-era').addEventListener('change', (e) => { humanSys && humanSys.setEra(+e.target.value); toast(+e.target.value ? 'Etapa: ' + e.target.options[e.target.selectedIndex].text : 'Construcción detenida'); });
+    buildToolsEl.addEventListener('change', (e) => {
+      if (e.target.id === 'ct-show') { params.showZones = e.target.checked; recolorAll(); }
+      else if (e.target.id === 'ct-era') { humanSys && humanSys.setEra(+e.target.value); renderAssets(); toast(+e.target.value ? 'Etapa activada' : 'Construcción detenida'); }
+      else if (e.target.dataset.a) { humanSys && humanSys.setAllowed(e.target.dataset.a, e.target.checked); }
+    });
+    renderAssets();
   }
 
   return {

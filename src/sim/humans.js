@@ -118,6 +118,17 @@ export async function createHumanSystem(ctx) {
   let buildEra = 0;
   const ERA_TIER = [0, 0, 1, 2, 3];          // tier de vivienda según la etapa elegida
   const HOME_CAP = [1, 2, 3, 5];             // capacidad de humanos por vivienda (carpa→casa)
+  const HOME_KEY = ['carpa', 'choza', 'cabaña', 'casa'];
+  // assets DISPONIBLES por etapa (el usuario elige cuáles permitir)
+  const ERA_ASSETS = {
+    1: ['carpa', 'fogata'],
+    2: ['choza', 'fogata', 'aserradero', 'muelle'],
+    3: ['cabaña', 'fogata', 'aserradero', 'muelle', 'granja', 'mina'],
+    4: ['casa', 'fogata', 'aserradero', 'muelle', 'granja', 'mina', 'mercado'],
+  };
+  const ASSET_LABEL = { carpa: '⛺ Carpa', choza: '🛖 Choza', 'cabaña': '🏚️ Cabaña', casa: '🏠 Casa', fogata: '🔥 Fogata', aserradero: '🪚 Aserradero', muelle: '⚓ Muelle', granja: '🌾 Granja', mina: '⛏️ Mina', mercado: '🏪 Mercado' };
+  const allowed = new Set();                 // assets que el usuario permite construir
+  function homeAllowed() { return allowed.has(HOME_KEY[ERA_TIER[buildEra]]); }
   const homesReg = [];                       // viviendas reales {tier,x,z,cap,occ,group,model,scaffold,building,...}
   const HALF = SIZE * 0.5 * 0.96;
   function isLand(x, z) {                     // tierra firme caminable (ni agua, ni acantilado/barranco)
@@ -242,6 +253,7 @@ export async function createHumanSystem(ctx) {
   // ---- FOGATAS: 1 cada ~5 humanos (dan luz al pueblo) ----
   const fires = [];
   function ensureFires() {
+    if (!allowed.has('fogata')) return;        // la fogata se construye si está permitida
     const needed = Math.ceil(humans.length / 5);
     while (fires.length < needed) {
       const c = villageCenter || { x: 0, z: 0 };
@@ -281,15 +293,16 @@ export async function createHumanSystem(ctx) {
       if (p >= 1) { hm.building = false; hm.group.remove(hm.scaffold); hm.scaffold.traverse((o) => o.geometry?.dispose?.()); hm.model.scale.y = 1; addBuildingPoint(hm.x, hm.z); }
     }
   }
-  function assignHome(h) {                     // se muda a una con lugar; si no hay, construye una nueva (es el constructor)
+  function assignHome(h) {                     // se muda a una con lugar; si no, construye una nueva (si está permitida)
     if (h.homeRef) return;
     for (const hm of homesReg) if (hm.occ.size < hm.cap) { hm.occ.add(h.data.id); h.homeRef = hm; return; }
+    if (!homeAllowed()) return;                // el usuario aún no permitió ese tipo de vivienda
     const hm = startHome(ERA_TIER[buildEra]); hm.occ.add(h.data.id); h.homeRef = hm; h.builderOf = hm;
   }
   function checkCivic(instant) {
-    if (buildEra < 1) return;                  // las construcciones se habilitan por etapas
+    if (buildEra < 1) return;
     const n = humans.length; let changed = false;
-    for (const def of CIVIC) if (!builtCivic.has(def.id) && n >= def.pop) { placeCivic(def, instant); if (!instant) toast(def.label + ' en construcción'); changed = true; }
+    for (const def of CIVIC) if (!builtCivic.has(def.id) && allowed.has(def.id) && n >= def.pop) { placeCivic(def, instant); if (!instant) toast(def.label + ' en construcción'); changed = true; }   // solo los permitidos
     if (changed) metaSet('civic', [...builtCivic]);
   }
 
@@ -646,10 +659,6 @@ export async function createHumanSystem(ctx) {
     html += `<div class="stat">Población: <b>${n}</b>${nm ? ' · próximo hito: ' + nm : ''}</div>`;
     html += `<div class="stat" id="sim-res">${resText()}</div>`;
     html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
-    const eras = ['Sin construir', 'Campamento (carpas)', 'Aldea (chozas)', 'Pueblo (cabañas)', 'Ciudad (casas)'];
-    html += '<div class="stat" style="margin-top:8px;">🏗️ Etapa de construcción</div>';
-    html += `<select id="sim-era" style="width:100%;margin:2px 0 6px;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">` +
-      eras.map((l, i) => `<option value="${i}"${i === buildEra ? ' selected' : ''}>${l}</option>`).join('') + '</select>';
     html += `<input id="sim-search" placeholder="🔍 buscar @nombre" value="${escapeHtml(searchQ)}" style="width:100%;margin:5px 0;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">`;
     if (followId) { const fh = humans.find((x) => x.data.id === followId); if (fh) html += `<div class="stat" style="display:flex;justify-content:space-between;align-items:center;">🎥 Siguiendo a <b>${escapeHtml(fh.data.name)}</b> <button id="sim-unfollow">⏹</button></div>`; }
     html += '<div id="sim-list">';
@@ -670,12 +679,6 @@ export async function createHumanSystem(ctx) {
   }
   function applyFilter() { const q = searchQ.trim().toLowerCase(); panel.querySelectorAll('.h-item').forEach((el) => { el.style.display = (!q || el.dataset.name.includes(q)) ? '' : 'none'; }); }
   panel.addEventListener('input', (e) => { if (e.target.id === 'sim-search') { searchQ = e.target.value; applyFilter(); } });
-  panel.addEventListener('change', (e) => {
-    if (e.target.id === 'sim-era') {
-      buildEra = +e.target.value; metaSet('buildEra', buildEra); checkCivic();
-      toast(buildEra ? 'Etapa: ' + e.target.options[e.target.selectedIndex].text : 'Construcción detenida');
-    }
-  });
   panel.addEventListener('click', async (e) => {
     initAudio();                               // habilita el sonido de los diálogos (gesto del usuario)
     const b = e.target.closest('button'); if (!b) return;
@@ -694,11 +697,19 @@ export async function createHumanSystem(ctx) {
   // carga inicial desde la DB
   const savedRes = await metaGet('resources', null); if (savedRes) Object.assign(resources, savedRes);
   buildEra = await metaGet('buildEra', 0);
+  for (const k of await metaGet('allowed', [])) allowed.add(k);
   const saved = (await dbGetAll('humans')).sort((a, b) => a.arrival - b.arrival);
   for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d, false); }
   if (saved.length) { recomputeTiers(null); checkCivic(true); ensureFires(); }   // normaliza, reconstruye lo comunitario y las fogatas
 
-  function setEra(n) { buildEra = n; metaSet('buildEra', buildEra); checkCivic(); }
+  function setEra(n) {
+    buildEra = n; metaSet('buildEra', buildEra);
+    const list = ERA_ASSETS[n] || [];
+    if (n > 0 && !list.some((k) => allowed.has(k))) { allowed.add(HOME_KEY[ERA_TIER[n]]); allowed.add('fogata'); metaSet('allowed', [...allowed]); }   // por defecto: vivienda + fogata
+    checkCivic(); ensureFires();
+  }
+  function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); }
+  function eraAssets() { return (ERA_ASSETS[buildEra] || []).map((k) => ({ key: k, label: ASSET_LABEL[k], on: allowed.has(k) })); }
   function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const f of fires) scene.remove(f.light); panel.remove(); styleEl.remove(); }
-  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, dispose, count: () => humans.length };
+  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, setAllowed, eraAssets, dispose, count: () => humans.length };
 }
