@@ -34,8 +34,9 @@ export async function createHumanSystem(ctx) {
   const { scene, heightAt, findReliefSpots, terrainClassAt, zoneSpots, SIZE, getTime, camera, controls, toast } = ctx;
   const viewOnly = !!ctx.viewOnly;             // modo "Ver Mundo": solo observar y seguir
   const groundAt = ctx.groundAt || heightAt;   // altura EXACTA de la superficie (bilineal) → no se hunden
-  let followId = null, searchQ = '', _followPrev = null;
+  let followId = null, searchQ = '', _followPrev = null, detailEl = null;
   const _ft = new THREE.Vector3();   // scratch para seguir (3ra persona)
+  const ALL_JOBS = ['Recolector', 'Pescador', 'Leñador', 'Cazador', 'Agricultor', 'Constructor', 'Artesano', 'Minero', 'Marinero', 'Comerciante', 'Cocinero', 'Estudiante', 'Médico', 'Maestro', 'Capataz', 'Alcalde'];
   await dbInit();
   const group = new THREE.Group(); scene.add(group);
   const homeGroup = new THREE.Group(); scene.add(homeGroup);
@@ -145,10 +146,27 @@ export async function createHumanSystem(ctx) {
     let idx = Math.floor(sen * pool.length) + ((Math.random() * 3 | 0) - 1);
     return pool[Math.min(pool.length - 1, Math.max(0, idx))];
   }
-  function reassignJobs() {                   // re-asigna oficios al cambiar de etapa (se desbloquean trabajos)
-    const n = humans.length;
-    for (const h of humans) { const j = pickJob(h.data.arrival, n); if (j !== h.data.job) { h.data.job = j; attachTool(h); dbPut('humans', h.data); } }
+  function reassignJobs() {                   // re-evalúa puestos al cambiar de etapa
+    for (const h of humans) assignWork(h);
     refreshPanel();
+  }
+  // ---- PUESTOS DE TRABAJO: el edificio define el oficio (con cupos) ----
+  const BASIC = ['Recolector', 'Pescador', 'Leñador'];   // oficios de subsistencia (sin edificio: choza)
+  const WP_DEF = {
+    aserradero: { jobs: ['Leñador'], cap: 3 },
+    muelle: { jobs: ['Pescador', 'Marinero'], cap: 4 },
+    granja: { jobs: ['Agricultor'], cap: 4 },
+    mina: { jobs: ['Minero'], cap: 3 },
+    mercado: { jobs: ['Comerciante', 'Cocinero'], cap: 3 },
+  };
+  const workplaces = [];
+  function registerWorkplace(id, x, z) { const d = WP_DEF[id]; if (d) workplaces.push({ id, x, z, jobs: d.jobs, cap: d.cap, workers: new Set() }); }
+  function assignWork(h) {                     // toma un puesto especializado libre; si no hay, oficio básico
+    if (h.lockJob) return;                      // oficio fijado a mano desde la ficha
+    if (h.workplace && h.workplace.workers.has(h.data.id)) return;
+    for (const wp of workplaces) if (wp.workers.size < wp.cap) { wp.workers.add(h.data.id); h.workplace = wp; const j = pick(wp.jobs); if (j !== h.data.job) { h.data.job = j; attachTool(h); dbPut('humans', h.data); } return; }
+    h.workplace = null;
+    if (!BASIC.includes(h.data.job)) { h.data.job = pick(BASIC); attachTool(h); dbPut('humans', h.data); }
   }
   const homesReg = [];                       // viviendas reales {tier,x,z,cap,occ,group,model,scaffold,building,...}
   const HALF = SIZE * 0.5 * 0.96;
@@ -236,7 +254,7 @@ export async function createHumanSystem(ctx) {
     group.add(model);
     civicPos[def.id] = { x, z };
     builtCivic.add(def.id);
-    if (instant) return;                                // al recargar: ya construida
+    if (instant) { registerWorkplace(def.id, x, z); return; }   // al recargar: ya construida (registra su puesto)
     model.scale.y = 0.02;
     const scaffold = buildScaffold(); group.add(scaffold);
     civicBuilds.push({ def, group, model, scaffold, t: 0, total: 60 + def.pop * 3 });   // las obras llevan su tiempo
@@ -248,7 +266,7 @@ export async function createHumanSystem(ctx) {
       if (p >= 1) {
         if (b.scaffold) { b.group.remove(b.scaffold); b.scaffold.traverse((o) => o.geometry?.dispose?.()); }
         b.model.scale.y = 1; civicBuilds.splice(i, 1);
-        if (b.def) toast(b.def.label + ' terminado');
+        if (b.def) { toast(b.def.label + ' terminado'); registerWorkplace(b.def.id, b.group.position.x, b.group.position.z); }   // habilita su puesto de trabajo
         addBuildingPoint(b.group.position.x, b.group.position.z);   // une con un camino a la más cercana
       }
     }
@@ -384,11 +402,11 @@ export async function createHumanSystem(ctx) {
     g.traverse((o) => { o.castShadow = true; });
     return g;
   }
-  function buildBoat() {                                // barca en la orilla (Pescadores/Marineros)
+  function makeRaft() {                                 // balsa de troncos (hasta 4 personas) — objeto real
     const g = new THREE.Group();
-    const hull = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.35, 3.2, 7, 1, false, 0, Math.PI), M.wood);
-    hull.rotation.set(Math.PI / 2, 0, Math.PI / 2); hull.scale.set(1, 1, 0.6);
-    g.add(hull); g.traverse((o) => { o.castShadow = true; o.receiveShadow = true; });
+    for (let i = 0; i < 5; i++) { const log = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 3.0, 7), M.wood); log.rotation.z = Math.PI / 2; log.position.set(0, 0, i * 0.55 - 1.1); g.add(log); }
+    for (const x of [-1.1, 1.1]) { const cr = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, 2.8), M.roof); cr.position.set(x, 0.2, 0); g.add(cr); }
+    g.traverse((o) => { o.castShadow = true; o.receiveShadow = true; });
     return g;
   }
 
@@ -422,10 +440,32 @@ export async function createHumanSystem(ctx) {
       mine: toLand(one('ladera', one('cima', c)).x, one('ladera', one('cima', c)).z),
       plaza: toLand(c.x, c.z),
     };
-    const boat = buildBoat();               // barca en la orilla (sobre el agua, frente a la costa)
-    boat.position.set(rawShore.x, Math.max(0, heightAt(rawShore.x, rawShore.z)) + 0.15, rawShore.z);
-    homeGroup.add(boat);
     return anchors;
+  }
+  // ---- BALSAS: los nuevos llegan en balsas de hasta 4 personas (desde mar adentro) ----
+  const RAFT_CAP = 4;
+  const rafts = []; let fillingRaft = null;
+  function boardRaft(h) {
+    if (!fillingRaft || fillingRaft.members.length >= RAFT_CAP || fillingRaft.departed) {
+      const off = farOffshore(arrivalSpot());
+      fillingRaft = { mesh: makeRaft(), members: [], x: off.x, z: off.z, depart: 1.2, departed: false, done: false };
+      scene.add(fillingRaft.mesh); rafts.push(fillingRaft);
+    }
+    const r = fillingRaft; h.raft = r; r.members.push(h); return r;
+  }
+  function updateRafts(dt) {
+    const ap = arrivalSpot();
+    for (const r of rafts) {
+      if (r.done) continue;
+      if (!r.departed) { r.depart -= dt; if (r.depart <= 0) { r.departed = true; if (fillingRaft === r) fillingRaft = null; } }
+      else {
+        const dx = ap.x - r.x, dz = ap.z - r.z, d = Math.hypot(dx, dz);
+        if (d > 2 && !isLand(r.x, r.z)) { r.x += dx / d * BOAT * dt; r.z += dz / d * BOAT * dt; r.mesh.rotation.y = Math.atan2(dx, dz); }
+        else { r.done = true; for (const h of r.members) { h.disembarked = true; h._gather = null; h.stuck = 0; const l = toLand(h.px, h.pz); h.px = l.x; h.pz = l.z; } }
+      }
+      r.mesh.position.set(r.x, 0.2 + Math.sin(r.x * 0.5 + (getTime ? 0 : 0)) * 0, r.z);
+      r.members.forEach((h, k) => { if (h.arriving && !h.disembarked) { const ox = (k % 2) * 0.9 - 0.45, oz = (k / 2 | 0) * 0.95 - 0.48; h.px = r.x + ox; h.pz = r.z + oz; h.mesh.visible = true; h.mesh.position.set(h.px, r.mesh.position.y + 0.15, h.pz); h.mesh.rotation.y = r.mesh.rotation.y; } });
+    }
   }
   // rutina diaria según la hora: dormir / trabajar / comer / socializar
   function dayActivity(time) {
@@ -487,12 +527,13 @@ export async function createHumanSystem(ctx) {
     if (t) { h.mesh.add(t); h.tool = t; }
   }
   function startBuild(h) { h.building = true; h.buildT = 0; h.stage = -1; rebuildHome(h, 0); }
-  function anchorFor(job) {
-    const A = getAnchors();
+  function anchorFor(h) {
+    if (h.workplace) return h.workplace;                 // trabaja en su edificio (aserradero/muelle/granja/mina/mercado)
+    const A = getAnchors(), job = h.data.job;            // oficio básico → al recurso correspondiente
     if (job === 'Pescador' || job === 'Marinero') return A.shore;
     if (job === 'Leñador' || job === 'Recolector' || job === 'Cazador' || job === 'Agricultor') return A.forest;
     if (job === 'Minero') return A.mine;
-    return A.plaza;   // Constructor, Artesano, Comerciante, Cocinero, Estudiante, Médico, Maestro, Capataz, Alcalde
+    return A.plaza;
   }
 
   function rebuildHome(h, stage) {
@@ -504,11 +545,11 @@ export async function createHumanSystem(ctx) {
   function spawn(data, arriving) {
     const mesh = buildHumanMesh(data.shirt, data.height);
     group.add(mesh);
-    let sx, sz;
-    if (arriving) { const off = farOffshore(arrivalSpot()); sx = off.x; sz = off.z; }   // aparece lejos en el mar y se acerca
-    else { const hp = data.home ? toLand(data.home.x, data.home.z) : toLand(0, 0); data.home = hp; sx = hp.x; sz = hp.z; }
-    const h = { data, mesh, home: null, homeRef: null, builderOf: null, tool: null, px: sx, pz: sz, tx: sx, tz: sz, t: Math.random() * 6.283, retarget: 0, arriving: !!arriving, incoming: !!arriving, _gather: null };
+    let sx = 0, sz = 0;
+    if (!arriving) { const hp = data.home ? toLand(data.home.x, data.home.z) : toLand(0, 0); data.home = hp; sx = hp.x; sz = hp.z; }
+    const h = { data, mesh, home: null, homeRef: null, builderOf: null, workplace: null, tool: null, px: sx, pz: sz, tx: sx, tz: sz, t: Math.random() * 6.283, retarget: 0, arriving: !!arriving, raft: null, disembarked: false, _gather: null };
     attachTool(h);
+    if (arriving) { boardRaft(h); h.px = h.raft.x; h.pz = h.raft.z; }   // sube a una balsa (hasta 4) y llega desde el mar
     humans.push(h);
     return h;
   }
@@ -518,13 +559,11 @@ export async function createHumanSystem(ctx) {
     const n = humans.length;
     for (const h of humans) {
       const d = h.data, tier = tierOf(d.arrival, n);
-      if (d.tier !== tier) {
-        d.tier = tier; d.job = pickJob(d.arrival, n);   // ascenso → mejor oficio de la etapa
-        attachTool(h);                                 // nueva herramienta del oficio
-        const ht = Math.min(3, tier);
-        if (d.homeTier !== ht) d.homeTier = ht;   // (las viviendas se gestionan por el registro/etapas)
+      if (d.tier !== tier) {                            // sube de rango por antigüedad (el oficio lo da el puesto/edificio)
+        d.tier = tier;
+        const ht = Math.min(3, tier); if (d.homeTier !== ht) d.homeTier = ht;
         dbPut('humans', d);
-        if (announcePrevId && d.id === announcePrevId) toast('⬆️ ' + d.name + ' ascendió a ' + d.job);
+        if (announcePrevId && d.id === announcePrevId) toast('⬆️ ' + d.name + ' subió a ' + RANK_NAMES[tier]);
       }
     }
   }
@@ -536,7 +575,7 @@ export async function createHumanSystem(ctx) {
     const data = {
       id: 'h' + total + '-' + Date.now() + '-' + ((Math.random() * 1e6) | 0),
       name: (name || 'Follower ' + total).trim(), arrival: total,
-      sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pickJob(total, total), homeTier: Math.min(3, tier),
+      sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pick(BASIC), homeTier: Math.min(3, tier),
       shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25, home: null,   // el hogar se fija al asentarse
     };
     await dbPut('humans', data);
@@ -553,6 +592,7 @@ export async function createHumanSystem(ctx) {
     const i = humans.findIndex((h) => h.data.id === id); if (i < 0) return;
     const h = humans[i];
     if (h.homeRef) h.homeRef.occ.delete(id);   // libera lugar en la vivienda
+    if (h.workplace) h.workplace.workers.delete(id);   // libera el puesto de trabajo
     group.remove(h.mesh); h.mesh.traverse((o) => o.geometry?.dispose?.());
     humans.splice(i, 1);
     await dbDelete('humans', id);
@@ -566,7 +606,8 @@ export async function createHumanSystem(ctx) {
   async function resetAll() {
     for (const h of humans) group.remove(h.mesh);
     humans.length = 0; villageCenter = null; anchors = null;
-    homesReg.length = 0; builtCivic.clear(); civicBuilds.length = 0;
+    homesReg.length = 0; builtCivic.clear(); civicBuilds.length = 0; workplaces.length = 0;
+    for (const r of rafts) scene.remove(r.mesh); rafts.length = 0; fillingRaft = null;
     while (civicGroup.children.length) civicGroup.remove(civicGroup.children[0]);
     for (const f of fires) scene.remove(f.light); fires.length = 0;
     while (pathGroup.children.length) pathGroup.remove(pathGroup.children[0]); buildingPts.length = 0; pathGrows.length = 0;
@@ -581,23 +622,20 @@ export async function createHumanSystem(ctx) {
     const night = time < 6 || time > 20.5;
     const cx = camera.position.x, cz = camera.position.z;
     const cull2 = (ctx.cullDist || SIZE * 0.6) ** 2;
+    updateRafts(dt);                                    // balsas trayendo nuevos followers
     updateCivicBuilds(dt);                              // obras comunitarias se levantan
     updateHomeBuilds(dt);                               // viviendas se levantan por fases
     updatePaths(dt);                                    // caminos se van marcando
     for (const h of humans) {
       if (h.arriving) {
-        h.mesh.visible = true; h.t += dt;
-        if (h.incoming) {                               // viene desde lejos por el mar hacia el punto de llegada
-          const ap = arrivalSpot(), dx = ap.x - h.px, dz = ap.z - h.pz, d = Math.hypot(dx, dz);
-          if (d > 1.5 && !isLand(h.px, h.pz)) { h.px += dx / d * BOAT * dt; h.pz += dz / d * BOAT * dt; h.mesh.rotation.y = Math.atan2(dx, dz); h.mesh.position.set(h.px, 0.35 + Math.sin(h.t * 2) * 0.08, h.pz); }
-          else { h.incoming = false; h._gather = null; h.stuck = 0; }   // tocó tierra → camina al pueblo
-          continue;
-        }
+        h.mesh.visible = true; h.t += dt; h.arrT = (h.arrT || 0) + dt;
+        if (h.raft && !h.disembarked) continue;         // la balsa lo lleva (updateRafts lo posiciona)
         if (!h._gather) h._gather = gatherTarget();
-        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 6) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }
+        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 5 || h.arrT > 40) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // desembarcó y llegó al pueblo
         continue;
       }
       if (buildEra > 0 && !h.homeRef) assignHome(h);     // ¿hay etapa activa? consigue/levanta vivienda
+      if (!h.workplace) assignWork(h);                   // toma un puesto de trabajo disponible (o básico)
       if (h.builderOf && !h.builderOf.building) h.builderOf = null;   // terminó de construir
       const building = !!h.builderOf;
       const act = building ? 'build' : dayActivity(time);            // rutina del día
@@ -621,7 +659,7 @@ export async function createHumanSystem(ctx) {
         let base;
         if (building) base = h.builderOf;                                          // levanta su casa
         else if (act === 'eat') base = civicPos.mercado || civicPos.fogata || getAnchors().plaza;   // comer en mercado/fogata
-        else if (act === 'work') base = anchorFor(h.data.job);                     // a su oficio
+        else if (act === 'work') base = anchorFor(h);                              // a su puesto / oficio
         else base = h.homeRef || h.data.home || getAnchors().plaza;                // dormir/socializar cerca de casa/plaza
         const a = Math.random() * 6.283, r = building ? 1.5 : SIZE * 0.012 * Math.random();
         const t = toLand(base.x + Math.cos(a) * r, base.z + Math.sin(a) * r);
@@ -672,9 +710,48 @@ export async function createHumanSystem(ctx) {
       _followPrev = p.clone();
       toast('🎥 Siguiendo a ' + h.data.name + ' · girá alrededor con clic-DER');
     }
+    if (h) showDetail(h);
     refreshPanel();
   }
-  function clearFollow() { followId = null; _followPrev = null; refreshPanel(); }
+  function clearFollow() { followId = null; _followPrev = null; if (detailEl) detailEl.style.display = 'none'; refreshPanel(); }
+  // ---- FICHA del humano seguido: info + edición ----
+  function bar(v) { return `<div style="background:#26324a;border-radius:4px;height:7px;margin:2px 0 6px;"><div style="height:7px;border-radius:4px;background:#6fa8ff;width:${Math.round((v || 0) * 100)}%;"></div></div>`; }
+  function renderDetail(h) {
+    const d = h.data, sel = (arr, v) => arr.map((o) => `<option${o === v ? ' selected' : ''}>${o}</option>`).join('');
+    detailEl.innerHTML =
+      `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><b>${MOOD_EMOJI[needKey(h)]} Ficha</b><button id="det-close" style="cursor:pointer;background:rgba(40,60,95,.6);color:#e7eefc;border:none;border-radius:7px;padding:3px 8px;">✕</button></div>` +
+      `<input id="det-name" value="${escapeHtml(d.name)}" style="width:100%;margin-bottom:4px;padding:5px 7px;border-radius:7px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;">` +
+      `<div style="color:#9fb4d4;font-size:12px;margin-bottom:4px;">#${d.arrival} · ${RANK_NAMES[d.tier ?? 0]} · ${h.workplace ? 'trabaja en ' + h.workplace.id : 'oficio básico'} · ${h.homeRef ? '🏠' : 'sin casa'}</div>` +
+      `<label style="font-size:12px;">Oficio <select id="det-job" style="width:100%;margin-bottom:4px;">${sel(ALL_JOBS, d.job)}</select></label>` +
+      `<div style="display:flex;gap:6px;"><label style="font-size:12px;flex:1;">Signo<select id="det-sign" style="width:100%;">${sel(SIGNS, d.sign)}</select></label><label style="font-size:12px;flex:1;">Personalidad<select id="det-pers" style="width:100%;">${sel(PERSONALITIES, d.personality)}</select></label></div>` +
+      `<div style="font-size:12px;margin-top:6px;">🍽️ hambre${bar(h.hunger)}😴 energía${bar(h.energy)}🙂 social${bar(h.social)}</div>`;
+  }
+  function showDetail(h) {
+    if (!detailEl) {
+      detailEl = document.createElement('div'); detailEl.id = 'sim-detail';
+      detailEl.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:28;width:240px;background:rgba(10,16,28,.82);border:1px solid rgba(160,190,255,.3);border-radius:12px;padding:12px;backdrop-filter:blur(6px);font-family:system-ui,sans-serif;color:#e7eefc;font-size:13px;';
+      document.body.appendChild(detailEl);
+      detailEl.addEventListener('change', onDetailEdit);
+      detailEl.addEventListener('input', (e) => { if (e.target.id === 'det-name') { const h2 = humans.find((x) => x.data.id === detailEl.dataset.id); if (h2) { h2.data.name = e.target.value; dbPut('humans', h2.data); } } });
+      detailEl.addEventListener('click', (e) => { if (e.target.id === 'det-close') clearFollow(); });
+    }
+    detailEl.dataset.id = h.data.id; detailEl.style.display = 'block'; renderDetail(h);
+  }
+  function onDetailEdit(e) {
+    const h = humans.find((x) => x.data.id === detailEl.dataset.id); if (!h) return;
+    if (e.target.id === 'det-job') { h.data.job = e.target.value; h.lockJob = true; if (h.workplace) { h.workplace.workers.delete(h.data.id); h.workplace = null; } attachTool(h); }
+    else if (e.target.id === 'det-sign') h.data.sign = e.target.value;
+    else if (e.target.id === 'det-pers') h.data.personality = e.target.value;
+    dbPut('humans', h.data); refreshPanel();
+  }
+  // importa followers desde una lista de texto (solo los NUEVOS por nombre)
+  async function importFollowers(text) {
+    const have = new Set(humans.map((h) => h.data.name.toLowerCase()));
+    const names = String(text).split(/[\n,;]+/).map((s) => s.trim().replace(/^@/, '')).filter(Boolean);
+    let added = 0;
+    for (const nm of names) { if (have.has(nm.toLowerCase())) continue; have.add(nm.toLowerCase()); await addFollower(nm); added++; }
+    toast(added ? 'Importados ' + added + ' nuevos' : 'Sin nuevos para importar');
+  }
 
   // ---- panel de gestión (DOM, izquierda) ----
   const panel = document.createElement('div');
@@ -708,6 +785,7 @@ export async function createHumanSystem(ctx) {
     html += `<div class="stat">Población: <b>${n}</b>${nm ? ' · próximo hito: ' + nm : ''}</div>`;
     html += `<div class="stat" id="sim-res">${resText()}</div>`;
     if (!viewOnly) html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
+    if (!viewOnly) html += '<button class="full" id="sim-import">📄 Importar lista (.txt/.csv)</button>';
     html += `<input id="sim-search" placeholder="🔍 buscar @nombre" value="${escapeHtml(searchQ)}" style="width:100%;margin:5px 0;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">`;
     if (followId) { const fh = humans.find((x) => x.data.id === followId); if (fh) html += `<div class="stat" style="display:flex;justify-content:space-between;align-items:center;">🎥 Siguiendo a <b>${escapeHtml(fh.data.name)}</b> <button id="sim-unfollow">⏹</button></div>`; }
     html += '<div id="sim-list">';
@@ -733,6 +811,7 @@ export async function createHumanSystem(ctx) {
     const b = e.target.closest('button'); if (!b) return;
     if (b.id === 'sim-close') { hidePanel(); return; }
     if (b.id === 'sim-add') { const name = prompt('Nombre / @handle del follower:', 'Follower ' + (humans.length + 1)); if (name !== null) await addFollower(name); return; }
+    if (b.id === 'sim-import') { const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.txt,.csv,text/plain'; inp.onchange = () => { const f = inp.files[0]; if (!f) return; const rd = new FileReader(); rd.onload = () => importFollowers(rd.result); rd.readAsText(f); }; inp.click(); return; }
     if (b.id === 'sim-reset') { if (confirm('¿Borrar todos los followers de la isla?')) await resetAll(); return; }
     if (b.id === 'sim-unfollow') { clearFollow(); return; }
     if (b.dataset.follow) { setFollow(b.dataset.follow); return; }
@@ -760,6 +839,6 @@ export async function createHumanSystem(ctx) {
   }
   function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); }
   function eraAssets() { return (ERA_ASSETS[buildEra] || []).map((k) => ({ key: k, label: ASSET_LABEL[k], on: allowed.has(k) })); }
-  function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const f of fires) scene.remove(f.light); panel.remove(); styleEl.remove(); }
+  function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const r of rafts) scene.remove(r.mesh); for (const f of fires) scene.remove(f.light); if (arrivalMarker) scene.remove(arrivalMarker); detailEl?.remove(); panel.remove(); styleEl.remove(); }
   return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, setAllowed, eraAssets, setArrival, dispose, count: () => humans.length };
 }

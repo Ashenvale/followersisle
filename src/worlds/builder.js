@@ -2402,6 +2402,22 @@ export async function create({ renderer, mode }) {
     libEl.innerHTML = html + '</div>';
   }
   function openLibrary() { refreshLibPanel(); libEl.style.display = 'block'; }
+  // backup PORTABLE a archivo (no depende del puerto/origen del navegador)
+  const BACKUP_KEYS = [SAVE_KEY, LIB_KEY, 'evermark_settings_v1', 'evermark_zones_v1', 'evermark_sim_meta_buildEra'];
+  function exportMaps() {
+    const data = {};
+    for (const k of [SAVE_KEY, LIB_KEY, 'evermark_settings_v1', 'evermark_zones_v1']) { const v = localStorage.getItem(k); if (v != null) data[k] = v; }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    a.download = 'evermark-mapas-' + Date.now() + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('Mapas exportados ✓');
+  }
+  function importMaps() {
+    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'application/json';
+    inp.onchange = () => { const f = inp.files[0]; if (!f) return; const r = new FileReader();
+      r.onload = () => { try { const d = JSON.parse(r.result); for (const k in d) localStorage.setItem(k, d[k]); refreshLibPanel(); toast('Mapas importados ✓ — recargá la página'); } catch (e) { toast('Archivo inválido'); } };
+      r.readAsText(f); };
+    inp.click();
+  }
 
   // ---- GUI ----
   const gui = new GUI({ title: CINE_MODE ? 'Evermark · Cinemática' : 'Mundo 3 · Constructor' });
@@ -2410,6 +2426,8 @@ export async function create({ renderer, mode }) {
   gui.add({ load: () => loadIsland(false) }, 'load').name('📂 Cargar isla (rápido)');
   gui.add({ saveAs: saveNamedIsland }, 'saveAs').name('💾 Guardar como…');
   gui.add({ lib: openLibrary }, 'lib').name('📚 Mis mapas');
+  gui.add({ exp: exportMaps }, 'exp').name('📤 Exportar mapas (backup)');
+  gui.add({ imp: importMaps }, 'imp').name('📥 Importar mapas');
   // construcción: oculta en la sección Cinemática
   const fB = gui.addFolder('Construcción');
   fB.add(params, 'sizeKm', { '0.2 km': 0.2, '0.5 km': 0.5, '1 km': 1, '2 km': 2, '5 km': 5 }).name('Tamaño del mapa').onChange(setSize);
