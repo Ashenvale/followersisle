@@ -32,6 +32,7 @@ export async function create({ renderer, mode }) {
     mar: true,
     wireframe: false,
     heatmap: false,         // vista de clasificación de relieve (playa/acantilado/barranco/…)
+    showZones: true,        // mostrar el coloreado de zonas (residencia/servicios)
     timeOfDay: 13,          // hora del día (0-24); por defecto MEDIODÍA y congelada
     dayCycle: false,        // por defecto NO avanza (la última selección queda fija)
     daySeconds: 120,        // duración de un día completo (s)
@@ -258,6 +259,7 @@ export async function create({ renderer, mode }) {
   let SIZE, SEG, N, CELL, LAND_MAX, SEA_FLOOR, STRENGTH_SCALE, BEACH_TOP;
   let geo = null, mesh = null, height = null, colors = null, posAttr = null, biomes = null, waterMask = null;
   let relief = null;            // clase de relieve por celda (playa/acantilado/barranco/… → terrainClassAt)
+  let zones = null;             // zonificación por celda: 0 ninguna · 1 residencia · 2 servicios (dónde se permite construir)
   let seasonSnowY = 1e9;        // cota de la línea de nieve (cambia con la estación; nieve solo por encima)
   let lakeMask = null;          // 1 en celdas de LAGO (agua dulce) → humedad más fuerte que los ríos
   let wetField = null;          // 0..1 proximidad al agua (alto cerca de agua, decae con la distancia)
@@ -363,6 +365,10 @@ export async function create({ renderer, mode }) {
     const jit = 0.9 + 0.2 * hash(idx * 0.137, idx * 0.911);     // grano natural
     const shade = (1 - rk * 0.22) * jit;                        // laderas algo más oscuras
     colors[o] = (r / 255) * shade; colors[o + 1] = (g / 255) * shade; colors[o + 2] = (bl / 255) * shade;
+    if (params.showZones && zones && zones[idx]) {       // tinte de zona (residencia azul · servicios naranja)
+      const zc = zones[idx] === 1 ? [80, 150, 230] : [230, 160, 60], k = 0.42;
+      colors[o] = colors[o] * (1 - k) + (zc[0] / 255) * k; colors[o + 1] = colors[o + 1] * (1 - k) + (zc[1] / 255) * k; colors[o + 2] = colors[o + 2] * (1 - k) + (zc[2] / 255) * k;
+    }
   }
   function recolorAll() {
     for (let i = 0; i < N * N; i++) colorVert(i);
@@ -1134,6 +1140,7 @@ export async function create({ renderer, mode }) {
     biomes = new Uint8Array(N * N);
     waterMask = new Uint8Array(N * N);
     relief = new Uint8Array(N * N);
+    zones = new Uint8Array(N * N);
     lakeMask = new Uint8Array(N * N);
     colors = new Float32Array(N * N * 3);
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -1677,11 +1684,39 @@ export async function create({ renderer, mode }) {
     }
   }
 
+  // ---- ZONIFICACIÓN: pintar dónde se permite construir (1 residencia · 2 servicios · 0 borrar) ----
+  const ZONES_KEY = 'evermark_zones_v1';
+  const zoneCounts = [0, 0, 0]; let zonesDirty = true; const _zoneSpots = { 1: [], 2: [] };
+  function paintZone(id) {
+    const rad = params.brushSize, rad2 = rad * rad, cells = Math.ceil(rad / CELL) + 1, ctr = worldToIndex(hit.x, hit.z);
+    for (let dj = -cells; dj <= cells; dj++) for (let di = -cells; di <= cells; di++) {
+      const i = ctr.i + di, j = ctr.j + dj;
+      if (i < 0 || j < 0 || i >= N || j >= N) continue;
+      const w = vertWorld(i, j);
+      if ((w.x - hit.x) ** 2 + (w.z - hit.z) ** 2 > rad2) continue;
+      const idx = j * N + i; if (height[idx] < 0) continue;
+      if (zones[idx] !== id) { zoneCounts[zones[idx]]--; zoneCounts[id]++; zones[idx] = id; colorVert(idx); }
+    }
+    geo.attributes.color.needsUpdate = true; zonesDirty = true; saveZones();
+  }
+  function zoneAt(wx, wz) { const c = worldToIndex(wx, wz); if (!zones || c.i < 0 || c.j < 0 || c.i >= N || c.j >= N) return 0; return zones[c.j * N + c.i]; }
+  function zoneSpots(t) {     // posiciones de mundo de las celdas de la zona t (cacheado)
+    if (zonesDirty) {
+      _zoneSpots[1].length = 0; _zoneSpots[2].length = 0;
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const z = zones[j * N + i]; if (z) { const w = vertWorld(i, j); _zoneSpots[z].push({ x: w.x, z: w.z }); } }
+      zonesDirty = false;
+    }
+    return _zoneSpots[t] || [];
+  }
+  function saveZones() { try { localStorage.setItem(ZONES_KEY, JSON.stringify({ n: N, z: b64FromU8(zones) })); } catch (e) {} }
+  function loadZones() { try { const s = JSON.parse(localStorage.getItem(ZONES_KEY) || 'null'); if (s && s.n === N && zones) { const u = u8FromB64(s.z); if (u.length === zones.length) { zones.set(u); zoneCounts[0] = zoneCounts[1] = zoneCounts[2] = 0; for (const v of zones) zoneCounts[v]++; zonesDirty = true; } } } catch (e) {} }
+
   function rgbHex(c) { return (c[0] << 16) | (c[1] << 8) | c[2]; }
   function setSel(kind, key) {
     selKind = kind; selKey = key;
     let col = 0xffe27a;                              // esculpir
     if (kind === 'asset') col = 0x7CFF9B;
+    else if (kind === 'zone') col = key === 1 ? 0x50a0ff : key === 2 ? 0xffa030 : 0xff7a7a;
     else if (kind === 'biome') col = key > 0 ? rgbHex(BIOMES[biomeKeys[key - 1]].color) : 0xff7a7a;
     ring.material.color.set(col);
     const selId = (kind === 'sculpt' || kind === 'nav') ? kind : kind[0] + ':' + key;
@@ -1696,6 +1731,7 @@ export async function create({ renderer, mode }) {
     if (showRing) ring.position.set(hit.x, hit.y + 0.2, hit.z);
     if (sculpting && hovering) {
       if (selKind === 'biome') paintBiome(selKey);
+      else if (selKind === 'zone') paintZone(selKey);
       else if (selKind === 'sculpt') stroke();
     }
   };
@@ -1705,6 +1741,7 @@ export async function create({ renderer, mode }) {
     if (!castToTerrain(ev)) return;
     if (selKind === 'asset') placeAsset(selKey, hit.x, hit.y, hit.z);
     else if (selKind === 'biome') { sculpting = true; paintBiome(selKey); }
+    else if (selKind === 'zone') { sculpting = true; paintZone(selKey); }
     else if (selKind === 'sculpt') { sculpting = true; flattenTarget = hit.y; stroke(); }
   };
   const onUp = (ev) => { if (ev.button === 0) sculpting = false; };
@@ -2638,6 +2675,7 @@ export async function create({ renderer, mode }) {
   configureForSize();
   if (!loadIsland(true)) buildTerrainMesh();
   applySizeToView();
+  loadZones(); recolorAll();        // restaura zonas pintadas y las muestra
   updateSky(); updateClockHud();
 
   // ---- panel de assets ----
@@ -2882,11 +2920,30 @@ export async function create({ renderer, mode }) {
   // ---- followers / humanos (simulación con DB) ----
   try {
     humanSys = await createHumanSystem({
-      scene, camera, controls, heightAt, findReliefSpots, terrainClassAt, SIZE, toast,
+      scene, camera, controls, heightAt, groundAt: heightBilinear, findReliefSpots, terrainClassAt, zoneSpots, SIZE, toast,
       getTime: () => params.timeOfDay, cullDist: SIZE * 0.6,
     });
     if (MANAGE_MODE) humanSys.showPanel();
   } catch (e) { console.error('humanSys', e); }
+
+  // ---- menú de CONSTRUCCIÓN (modo gestión): pintar zonas dónde se permite construir + etapa ----
+  let buildToolsEl = null;
+  if (MANAGE_MODE) {
+    buildToolsEl = document.createElement('div');
+    buildToolsEl.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:27;display:flex;flex-wrap:wrap;gap:6px;align-items:center;' +
+      'background:rgba(10,16,28,.72);border:1px solid rgba(160,190,255,.25);border-radius:10px;padding:7px 12px;backdrop-filter:blur(6px);font-family:system-ui,sans-serif;color:#e7eefc;font-size:13px;';
+    const eras = ['Sin construir', 'Campamento (carpas)', 'Aldea (chozas)', 'Pueblo (cabañas)', 'Ciudad (casas)'];
+    const bs = 'cursor:pointer;background:rgba(40,60,95,.6);color:#e7eefc;border:1px solid transparent;border-radius:7px;padding:5px 9px;font-size:13px;';
+    buildToolsEl.innerHTML = '<b>🏗️ Construir en:</b>' +
+      `<button style="${bs}" data-z="1">🏠 Residencia</button><button style="${bs}" data-z="2">🛠️ Servicios</button>` +
+      `<button style="${bs}" data-z="0">🧽 Borrar</button><button style="${bs}" data-z="nav">✋ Mover</button>` +
+      `<label style="margin-left:4px;"><input type="checkbox" id="ct-show" checked> ver zonas</label>` +
+      `<span style="margin-left:6px;">Etapa</span><select id="ct-era" style="${bs}">` + eras.map((l, i) => `<option value="${i}"${i === (humanSys ? humanSys.getEra() : 0) ? ' selected' : ''}>${l}</option>`).join('') + '</select>';
+    document.body.appendChild(buildToolsEl);
+    buildToolsEl.addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; const z = b.dataset.z; if (z === 'nav') setSel('nav', null); else setSel('zone', +z); });
+    buildToolsEl.querySelector('#ct-show').addEventListener('change', (e) => { params.showZones = e.target.checked; recolorAll(); });
+    buildToolsEl.querySelector('#ct-era').addEventListener('change', (e) => { humanSys && humanSys.setEra(+e.target.value); toast(+e.target.value ? 'Etapa: ' + e.target.options[e.target.selectedIndex].text : 'Construcción detenida'); });
+  }
 
   return {
     scene, camera, showHud: false, render: renderFrame,
@@ -2915,6 +2972,7 @@ export async function create({ renderer, mode }) {
       legendEl?.remove();
       libEl?.remove();
       cinePanel?.remove();
+      buildToolsEl?.remove();
       humanSys?.dispose();
       style.remove();
       scene.traverse((o) => {

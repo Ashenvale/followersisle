@@ -31,7 +31,8 @@ function tierOf(arrival, total) {
 
 export async function createHumanSystem(ctx) {
   // ctx = { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast, cullDist }
-  const { scene, heightAt, findReliefSpots, terrainClassAt, SIZE, getTime, camera, controls, toast } = ctx;
+  const { scene, heightAt, findReliefSpots, terrainClassAt, zoneSpots, SIZE, getTime, camera, controls, toast } = ctx;
+  const groundAt = ctx.groundAt || heightAt;   // altura EXACTA de la superficie (bilineal) → no se hunden
   let followId = null, searchQ = '', _followPrev = null;
   const _ft = new THREE.Vector3();   // scratch para seguir (3ra persona)
   await dbInit();
@@ -253,8 +254,14 @@ export async function createHumanSystem(ctx) {
     }
   }
   // ---- VIVIENDAS por etapa: se construyen por fases y tienen capacidad de humanos ----
-  function homeLot() {                        // lote en tierra firme cerca del pueblo, separado de otras casas
-    for (let n = 0; n < 30; n++) { const p = pickHome(); let ok = isLand(p.x, p.z); for (const hm of homesReg) if ((hm.x - p.x) ** 2 + (hm.z - p.z) ** 2 < 25) { ok = false; break; } if (ok) return p; }
+  function freeOf(x, z) { for (const hm of homesReg) if ((hm.x - x) ** 2 + (hm.z - z) ** 2 < 25) return false; return true; }
+  function homeLot() {                        // si hay ZONA RESIDENCIAL, solo ahí; si no, cerca del pueblo
+    const res = zoneSpots ? zoneSpots(1) : [];
+    if (res && res.length) {
+      for (let n = 0; n < 40; n++) { const s = res[(Math.random() * res.length) | 0], x = s.x + (Math.random() - 0.5) * 4, z = s.z + (Math.random() - 0.5) * 4; if (isLand(x, z) && freeOf(x, z)) return { x, z }; }
+      return res[(Math.random() * res.length) | 0];
+    }
+    for (let n = 0; n < 30; n++) { const p = pickHome(); if (isLand(p.x, p.z) && freeOf(p.x, p.z)) return p; }
     return pickHome();
   }
   function startHome(tier) {
@@ -400,16 +407,23 @@ export async function createHumanSystem(ctx) {
     const f = getAnchors().forest; return toLand(f.x, f.z);
   }
   // paso de caminata que NO entra al agua (si el siguiente paso es agua, replantea destino)
+  const STEP_ANGLES = [0, 0.6, -0.6, 1.2, -1.2, 1.9, -1.9];   // recto y desvíos para rodear obstáculos
   function stepLand(h, tx, tz, spd, dt) {
     const dx = tx - h.px, dz = tz - h.pz, d = Math.hypot(dx, dz);
     h.t += dt;
     if (d > 0.5) {
-      const nx = h.px + dx / d * spd * dt, nz = h.pz + dz / d * spd * dt;
-      const cur = heightAt(h.px, h.pz);
-      if (isLand(nx, nz) && Math.abs(heightAt(nx, nz) - cur) < 1.2) { h.px = nx; h.pz = nz; h.mesh.rotation.y = Math.atan2(dx, dz); }   // no salta escalones (barrancos)
-      else { h.retarget = 0; h._gather = null; }   // obstáculo → replantea destino
+      const dirx = dx / d, dirz = dz / d, step = spd * dt;
+      let moved = false;
+      for (const a of STEP_ANGLES) {                          // intenta recto; si hay agua/acantilado, esquiva
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const ox = dirx * ca - dirz * sa, oz = dirx * sa + dirz * ca;
+        const nx = h.px + ox * step, nz = h.pz + oz * step;
+        if (isLand(nx, nz)) { h.px = nx; h.pz = nz; h.mesh.rotation.y = Math.atan2(ox, oz); moved = true; break; }
+      }
+      h.stuck = moved ? 0 : (h.stuck || 0) + dt;
+      if (!moved) { h.retarget = 0; h._gather = null; }       // bloqueado → replantea
     }
-    const gy = Math.max(0, heightAt(h.px, h.pz));
+    const gy = Math.max(0, groundAt(h.px, h.pz));   // superficie real (bilineal) → los pies no se hunden
     h.mesh.position.set(h.px, gy + (d > 0.5 ? Math.abs(Math.sin(h.t * 5)) * 0.05 : 0), h.pz);
     return d <= 0.5;
   }
@@ -518,7 +532,7 @@ export async function createHumanSystem(ctx) {
       if (h.arriving) {                                 // recién llegado: ¿hay otros? va con ellos; si no, a los árboles
         h.mesh.visible = true;
         if (!h._gather) h._gather = gatherTarget();
-        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt)) { h.arriving = false; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // se asienta en tierra
+        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 6) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // llegó o no puede → se asienta donde está
         continue;
       }
       if (buildEra > 0 && !h.homeRef) assignHome(h);     // ¿hay etapa activa? consigue/levanta vivienda
@@ -684,6 +698,7 @@ export async function createHumanSystem(ctx) {
   for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d, false); }
   if (saved.length) { recomputeTiers(null); checkCivic(true); ensureFires(); }   // normaliza, reconstruye lo comunitario y las fogatas
 
+  function setEra(n) { buildEra = n; metaSet('buildEra', buildEra); checkCivic(); }
   function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const f of fires) scene.remove(f.light); panel.remove(); styleEl.remove(); }
-  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, dispose, count: () => humans.length };
+  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, dispose, count: () => humans.length };
 }
