@@ -3,7 +3,7 @@
 // rango (carpa→choza→cabaña→casa), y comportamiento día/noche con actividad según el oficio.
 // Persistencia en IndexedDB (escala a miles). El render/ctx lo provee el mundo (builder).
 import * as THREE from 'three';
-import { dbInit, dbGetAll, dbPut, dbDelete, dbClear, metaSet } from './db.js';
+import { dbInit, dbGetAll, dbPut, dbDelete, dbClear, metaGet, metaSet } from './db.js';
 
 const SIGNS = ['Aries', 'Tauro', 'Géminis', 'Cáncer', 'Leo', 'Virgo', 'Libra', 'Escorpio', 'Sagitario', 'Capricornio', 'Acuario', 'Piscis'];
 const PERSONALITIES = ['Trabajador', 'Soñador', 'Líder', 'Tímido', 'Aventurero', 'Sociable', 'Solitario', 'Creativo', 'Pragmático', 'Rebelde', 'Leal', 'Ambicioso', 'Glotón', 'Bromista'];
@@ -31,7 +31,9 @@ function tierOf(arrival, total) {
 
 export async function createHumanSystem(ctx) {
   // ctx = { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast, cullDist }
-  const { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast } = ctx;
+  const { scene, heightAt, findReliefSpots, terrainClassAt, SIZE, getTime, camera, controls, toast } = ctx;
+  let followId = null, searchQ = '', _followPrev = null;
+  const _ft = new THREE.Vector3();   // scratch para seguir (3ra persona)
   await dbInit();
   const group = new THREE.Group(); scene.add(group);
   const homeGroup = new THREE.Group(); scene.add(homeGroup);
@@ -45,7 +47,244 @@ export async function createHumanSystem(ctx) {
     wood: new THREE.MeshStandardMaterial({ color: 0x8a5a36, roughness: 0.85, flatShading: true }),
     roof: new THREE.MeshStandardMaterial({ color: 0x70392a, roughness: 0.8, flatShading: true }),
     house: new THREE.MeshStandardMaterial({ color: 0xcdbfa6, roughness: 0.8, flatShading: true }),
+    stone: new THREE.MeshStandardMaterial({ color: 0x8d8f96, roughness: 0.95, flatShading: true }),
+    fire: new THREE.MeshStandardMaterial({ color: 0xff7a2a, emissive: 0xb83a00, emissiveIntensity: 0.8, roughness: 0.6 }),
   };
+
+  // ---- ECONOMÍA: producción por oficio (por segundo de jornada) y recursos de la isla ----
+  // producción pasiva por oficio (simple, Fase 1). El pipeline realista (talar→aserradero) vendrá después.
+  const PROD = {
+    Leñador: { madera: 0.5 }, Recolector: { comida: 0.4 }, Agricultor: { comida: 0.6 }, Cazador: { comida: 0.5 },
+    Pescador: { pescado: 0.6 }, Marinero: { pescado: 0.4 }, Minero: { piedra: 0.5 },
+    Artesano: { oro: 0.2 }, Comerciante: { oro: 0.5 }, Cocinero: { comida: 0.3 },
+    Capataz: { oro: 0.3 }, Alcalde: { oro: 0.4 },
+  };
+  const resources = { madera: 0, comida: 0, piedra: 0, pescado: 0, oro: 0 };
+  const RES_ICON = { madera: '🪵', comida: '🍎', piedra: '🪨', pescado: '🐟', oro: '🪙' };
+  const WALK = 1.3;                          // m/s realista caminando
+  // ====== ÁNIMO + DIÁLOGOS (globitos con sonido al tipear) ======
+  let audioCtx = null, talkT = 3;
+  function initAudio() { try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) {} }
+  function blip() {                          // bip electrónico corto por letra
+    if (!audioCtx || audioCtx.state !== 'running') return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain(), t = audioCtx.currentTime;
+    o.type = 'square'; o.frequency.value = 620 + Math.random() * 220;
+    g.gain.setValueAtTime(0.035, t); g.gain.exponentialRampToValueAtTime(0.0008, t + 0.045);
+    o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t + 0.05);
+  }
+  const LINES = {
+    happy: ['¡Qué linda isla!', 'Me encanta esto', '¡A trabajar! 💪', 'Hoy rindo bien', '¡Buen día!'],
+    hungry: ['Tengo hambre…', '¿Hay algo de comer?', 'Me comería un pescado', 'Necesito comida'],
+    tired: ['Estoy agotado…', 'Qué sueño…', 'Necesito dormir', 'No doy más'],
+    lonely: ['Me siento solo', '¿Alguien para charlar?', 'Qué tranquilo todo…'],
+  };
+  const REPLIES = ['Jaja, sí', 'Totalmente', 'Dale', '¿En serio?', 'Cierto', 'Y sí…', 'Buenísimo'];
+  function roundRect(c, x, y, w, h, r) { c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
+  function drawBubble(b) {
+    const ctx = b.ctx, cv = b.cv; ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = 'rgba(14,20,32,0.88)'; roundRect(ctx, 4, 4, cv.width - 8, cv.height - 20, 14); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cv.width / 2 - 12, cv.height - 18); ctx.lineTo(cv.width / 2, cv.height - 2); ctx.lineTo(cv.width / 2 + 12, cv.height - 18); ctx.fill();
+    ctx.fillStyle = '#eaf1ff'; ctx.font = '22px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(b.text.substring(0, b.shown), cv.width / 2, (cv.height - 16) / 2);
+    b.tex.needsUpdate = true;
+  }
+  function say(h, text, delay) {
+    if (h.say) { h.mesh.remove(h.say.sp); h.say.tex.dispose(); h.say.sp.material.dispose(); }
+    const cv = document.createElement('canvas'); cv.width = 256; cv.height = 80;
+    const tex = new THREE.CanvasTexture(cv.getContext('2d').canvas);
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+    sp.scale.set(3.4, 1.06, 1); sp.position.set(0, 2.4, 0); sp.renderOrder = 12;
+    h.mesh.add(sp);
+    h.say = { cv, ctx: cv.getContext('2d'), tex, sp, text, shown: 0, t: -(delay || 0) };
+    drawBubble(h.say);
+  }
+  function updateSpeech(h, dt) {
+    const b = h.say; if (!b) return;
+    b.t += dt;
+    const tgt = Math.max(0, Math.min(b.text.length, Math.floor(b.t / 0.05)));
+    if (tgt > b.shown) { b.shown = tgt; drawBubble(b); blip(); }
+    if (b.shown >= b.text.length && b.t > b.text.length * 0.05 + 2.6) { h.mesh.remove(b.sp); b.tex.dispose(); b.sp.material.dispose(); h.say = null; }
+  }
+  function needKey(h) {                       // necesidad dominante → ánimo
+    const mx = Math.max(h.hunger || 0, h.energy || 0, h.social || 0);
+    if (mx < 0.4) return 'happy';
+    if ((h.hunger || 0) >= mx) return 'hungry';
+    if ((h.energy || 0) >= mx) return 'tired';
+    return 'lonely';
+  }
+  const MOOD_EMOJI = { happy: '😀', hungry: '🍽️', tired: '😴', lonely: '🙁' };
+  // ETAPAS de construcción (las habilita el usuario): 0 sin construir · 1 carpas · 2 chozas · 3 cabañas · 4 casas
+  let buildEra = 0;
+  const ERA_TIER = [0, 0, 1, 2, 3];          // tier de vivienda según la etapa elegida
+  const HOME_CAP = [1, 2, 3, 5];             // capacidad de humanos por vivienda (carpa→casa)
+  const homesReg = [];                       // viviendas reales {tier,x,z,cap,occ,group,model,scaffold,building,...}
+  const HALF = SIZE * 0.5 * 0.96;
+  function isLand(x, z) {                     // tierra firme caminable (ni agua, ni acantilado/barranco)
+    if (Math.abs(x) >= HALF || Math.abs(z) >= HALF || heightAt(x, z) <= 0.4) return false;
+    if (terrainClassAt) { const c = terrainClassAt(x, z); if (c === 'acantilado' || c === 'barranco') return false; }
+    return true;
+  }
+  function toLand(x, z) {                     // si cae en agua/fuera, busca el punto de tierra más cercano
+    if (isLand(x, z)) return { x, z };
+    for (let r = 5; r < SIZE * 0.5; r += 6) for (let a = 0; a < 10; a++) { const an = a / 10 * 6.283, nx = x + Math.cos(an) * r, nz = z + Math.sin(an) * r; if (isLand(nx, nz)) return { x: nx, z: nz }; }
+    return villageCenter || { x: 0, z: 0 };
+  }
+  let prodSaveT = 0;
+  const civicGroup = new THREE.Group(); scene.add(civicGroup);
+  const builtCivic = new Set();
+  const civicPos = {};                       // posición de cada construcción (para que la fauna/humanos la usen)
+  const civicBuilds = [];                    // obras comunitarias en curso (se levantan, no aparecen solas)
+  // construcciones comunitarias: aparecen al alcanzar la población indicada
+  const CIVIC = [
+    { id: 'fogata', label: '🔥 Fogata', pop: 1, at: 'plaza', off: [0, 0], make: makeFogata },
+    { id: 'aserradero', label: '🪚 Aserradero', pop: 3, at: 'forest', off: [7, 0], make: makeSawmill },
+    { id: 'muelle', label: '⚓ Muelle', pop: 5, at: 'shore', off: [0, 0], make: makeDock },
+    { id: 'granja', label: '🌾 Granja', pop: 10, at: 'forest', off: [0, 0], make: makeFarm },
+    { id: 'mina', label: '⛏️ Mina', pop: 14, at: 'mine', off: [0, 0], make: makeMine },
+    { id: 'mercado', label: '🏪 Mercado', pop: 20, at: 'plaza', off: [4, 2], make: makeMarket },
+  ];
+  function makeSawmill() {
+    const g = new THREE.Group();
+    const floor = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.15, 2.0), M.wood); floor.position.y = 0.08; g.add(floor);
+    const logPile = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 1.8, 6), M.wood); logPile.rotation.z = Math.PI / 2; logPile.position.set(-0.8, 0.4, 0.6); g.add(logPile);
+    const blade = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 0.06, 16), M.stone); blade.rotation.x = Math.PI / 2; blade.position.set(0.4, 0.62, 0); g.add(blade);
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.12, 2.2), M.roof); roof.position.y = 1.15; g.add(roof);
+    for (const sx of [-1.2, 1.2]) for (const sz of [-0.9, 0.9]) { const p = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.1, 0.12), M.wood); p.position.set(sx, 0.55, sz); g.add(p); }
+    return g;
+  }
+  function makeFogata() {
+    const g = new THREE.Group();
+    for (let i = 0; i < 6; i++) { const a = i / 6 * 6.283, s = new THREE.Mesh(new THREE.DodecahedronGeometry(0.18), M.stone); s.position.set(Math.cos(a) * 0.5, 0.1, Math.sin(a) * 0.5); g.add(s); }
+    const log = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.7, 5), M.wood); log.rotation.z = 1.4; log.position.y = 0.18; g.add(log);
+    const fire = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.5, 6), M.fire); fire.position.y = 0.45; g.add(fire);
+    return g;
+  }
+  function makeDock() {                                  // muelle de tablones sobre postes
+    const g = new THREE.Group();
+    for (let i = 0; i < 5; i++) { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.2, 5), M.wood); p.position.set(i * 0.9 - 1.8, -0.3, 0); g.add(p); }
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(5, 0.15, 1.4), M.wood); deck.position.set(0.4, 0.3, 0); g.add(deck);
+    return g;
+  }
+  function makeFarm() {                                  // parcela cercada con surcos
+    const g = new THREE.Group();
+    const soil = new THREE.Mesh(new THREE.BoxGeometry(3, 0.1, 3), M.mud); soil.position.y = 0.05; g.add(soil);
+    for (let i = 0; i < 4; i++) { const row = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.12, 0.25), M.thatch); row.position.set(0, 0.16, i * 0.7 - 1.05); g.add(row); }
+    return g;
+  }
+  function makeMine() {                                  // entrada de mina (marco de madera)
+    const g = new THREE.Group();
+    const l = new THREE.Mesh(new THREE.BoxGeometry(0.25, 1.6, 0.25), M.wood); l.position.set(-0.8, 0.8, 0);
+    const r = l.clone(); r.position.x = 0.8;
+    const top = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.3, 0.3), M.wood); top.position.y = 1.65;
+    const mound = new THREE.Mesh(new THREE.SphereGeometry(1.6, 8, 6, 0, 6.283, 0, 1.0), M.stone); mound.position.set(0, 0, -1.0); mound.scale.set(1, 0.8, 1);
+    g.add(mound, l, r, top); return g;
+  }
+  function makeMarket() {                                // puesto con toldo
+    const g = new THREE.Group();
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 1.4, 5), M.wood); p.position.set(sx, 0.7, sz * 0.7); g.add(p); }
+    const counter = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.5, 0.5), M.wood); counter.position.set(0, 0.55, 0.7); g.add(counter);
+    const canopy = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.12, 1.8), M.roof); canopy.position.y = 1.5; canopy.rotation.x = 0.06; g.add(canopy);
+    return g;
+  }
+  function buildScaffold() {                            // andamios mientras se construye
+    const g = new THREE.Group();
+    for (const sx of [-1.5, 1.5]) for (const sz of [-1.3, 1.3]) { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.2, 5), M.wood); p.position.set(sx, 1.1, sz); g.add(p); }
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.08, 0.08), M.wood); beam.position.y = 2.0; g.add(beam);
+    return g;
+  }
+  // coloca una obra comunitaria EN CONSTRUCCIÓN (se levanta con andamios; no aparece de golpe)
+  function placeCivic(def, instant) {
+    if (builtCivic.has(def.id)) return;
+    const A = getAnchors(); const base = A[def.at] || A.plaza;
+    const x = base.x + def.off[0], z = base.z + def.off[1];
+    const gy = Math.max(0, heightAt(x, z)) + (def.id === 'muelle' ? 0.1 : 0.02);
+    const group = new THREE.Group(); group.position.set(x, gy, z); civicGroup.add(group);
+    const model = def.make(); model.traverse((o) => { o.castShadow = true; o.receiveShadow = true; });
+    group.add(model);
+    civicPos[def.id] = { x, z };
+    builtCivic.add(def.id);
+    if (instant) return;                                // al recargar: ya construida
+    model.scale.y = 0.02;
+    const scaffold = buildScaffold(); group.add(scaffold);
+    civicBuilds.push({ def, group, model, scaffold, t: 0, total: 60 + def.pop * 3 });   // las obras llevan su tiempo
+  }
+  function updateCivicBuilds(dt) {
+    for (let i = civicBuilds.length - 1; i >= 0; i--) {
+      const b = civicBuilds[i]; b.t += dt; const p = Math.min(1, b.t / b.total);
+      b.model.scale.y = 0.02 + 0.98 * p;                // se levanta del suelo
+      if (p >= 1) {
+        if (b.scaffold) { b.group.remove(b.scaffold); b.scaffold.traverse((o) => o.geometry?.dispose?.()); }
+        b.model.scale.y = 1; civicBuilds.splice(i, 1);
+        if (b.def) toast(b.def.label + ' terminado');
+        addBuildingPoint(b.group.position.x, b.group.position.z);   // une con un camino a la más cercana
+      }
+    }
+  }
+  // ---- CAMINOS que se forman entre construcciones ----
+  const pathGroup = new THREE.Group(); scene.add(pathGroup);
+  const pathMat = new THREE.MeshStandardMaterial({ color: 0x9c7b52, roughness: 1 });
+  const buildingPts = [], pathGrows = [];
+  function addBuildingPoint(x, z) {
+    let nb = null, bd = Infinity;
+    for (const p of buildingPts) { const d = (p.x - x) ** 2 + (p.z - z) ** 2; if (d < bd) { bd = d; nb = p; } }
+    buildingPts.push({ x, z });
+    if (nb && bd > 6 && bd < (SIZE * 0.25) ** 2) {       // conecta con una construcción cercana razonable
+      const mx = (nb.x + x) / 2, mz = (nb.z + z) / 2, len = Math.sqrt(bd);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(len, 0.08, 0.8), pathMat);
+      m.position.set(mx, Math.max(0, heightAt(mx, mz)) + 0.05, mz);
+      m.rotation.y = -Math.atan2(z - nb.z, x - nb.x);
+      m.scale.x = 0.02; m.receiveShadow = true; pathGroup.add(m);
+      pathGrows.push({ m, t: 0 });
+    }
+  }
+  function updatePaths(dt) { for (let i = pathGrows.length - 1; i >= 0; i--) { const p = pathGrows[i]; p.t += dt; p.m.scale.x = Math.min(1, p.t / 6); if (p.t >= 6) pathGrows.splice(i, 1); } }
+  // ---- FOGATAS: 1 cada ~5 humanos (dan luz al pueblo) ----
+  const fires = [];
+  function ensureFires() {
+    const needed = Math.ceil(humans.length / 5);
+    while (fires.length < needed) {
+      const c = villageCenter || { x: 0, z: 0 };
+      const s = toLand(c.x + (Math.random() - 0.5) * SIZE * 0.06, c.z + (Math.random() - 0.5) * SIZE * 0.06);
+      const gy = Math.max(0, heightAt(s.x, s.z));
+      const g = makeFogata(); g.position.set(s.x, gy + 0.02, s.z); g.scale.y = 0.02; civicGroup.add(g);
+      const light = new THREE.PointLight(0xff8a3a, 1.3, 24, 2); light.position.set(s.x, gy + 1.3, s.z); scene.add(light);
+      civicBuilds.push({ group: g, model: g, scaffold: null, t: 0, total: 7 });
+      fires.push({ x: s.x, z: s.z, light });
+    }
+  }
+  // ---- VIVIENDAS por etapa: se construyen por fases y tienen capacidad de humanos ----
+  function homeLot() {                        // lote en tierra firme cerca del pueblo, separado de otras casas
+    for (let n = 0; n < 30; n++) { const p = pickHome(); let ok = isLand(p.x, p.z); for (const hm of homesReg) if ((hm.x - p.x) ** 2 + (hm.z - p.z) ** 2 < 25) { ok = false; break; } if (ok) return p; }
+    return pickHome();
+  }
+  function startHome(tier) {
+    const lot = homeLot();
+    const group = new THREE.Group(); group.position.set(lot.x, Math.max(0, heightAt(lot.x, lot.z)) + 0.02, lot.z); civicGroup.add(group);
+    const model = buildHome(tier, 0); group.add(model);
+    const scaffold = buildScaffold(); group.add(scaffold);
+    const hm = { tier, x: lot.x, z: lot.z, cap: HOME_CAP[tier], occ: new Set(), group, model, scaffold, building: true, buildT: 0, stage: 0, total: BUILD_TIME[tier] };
+    homesReg.push(hm); return hm;
+  }
+  function updateHomeBuilds(dt) {
+    for (const hm of homesReg) {
+      if (!hm.building) continue;
+      hm.buildT += dt; const stages = STAGES[hm.tier], p = Math.min(1, hm.buildT / hm.total), st = Math.min(stages - 1, Math.floor(p * stages));
+      if (st !== hm.stage) { hm.stage = st; hm.group.remove(hm.model); hm.model.traverse((o) => o.geometry?.dispose?.()); hm.model = buildHome(hm.tier, st); hm.group.add(hm.model); }
+      hm.model.scale.y = 0.02 + 0.98 * p;
+      if (p >= 1) { hm.building = false; hm.group.remove(hm.scaffold); hm.scaffold.traverse((o) => o.geometry?.dispose?.()); hm.model.scale.y = 1; addBuildingPoint(hm.x, hm.z); }
+    }
+  }
+  function assignHome(h) {                     // se muda a una con lugar; si no hay, construye una nueva (es el constructor)
+    if (h.homeRef) return;
+    for (const hm of homesReg) if (hm.occ.size < hm.cap) { hm.occ.add(h.data.id); h.homeRef = hm; return; }
+    const hm = startHome(ERA_TIER[buildEra]); hm.occ.add(h.data.id); h.homeRef = hm; h.builderOf = hm;
+  }
+  function checkCivic(instant) {
+    if (buildEra < 1) return;                  // las construcciones se habilitan por etapas
+    const n = humans.length; let changed = false;
+    for (const def of CIVIC) if (!builtCivic.has(def.id) && n >= def.pop) { placeCivic(def, instant); if (!instant) toast(def.label + ' en construcción'); changed = true; }
+    if (changed) metaSet('civic', [...builtCivic]);
+  }
 
   function buildHumanMesh(shirt, scale) {
     const g = new THREE.Group();
@@ -59,7 +298,7 @@ export async function createHumanSystem(ctx) {
   }
   // nº de fases de obra y duración (s) por tipo de vivienda
   const STAGES = [2, 3, 4, 4];
-  const BUILD_TIME = [4, 8, 14, 20];
+  const BUILD_TIME = [18, 45, 90, 150];      // s por vivienda: construir lleva tiempo (se ve el proceso por fases)
   const post = (x, z, h) => { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, h, 5), M.wood); p.position.set(x, h / 2, z); return p; };
   // construye la vivienda del nivel `tier` en la FASE `stage` (0..STAGES-1; la última = terminada)
   function buildHome(tier, stage) {
@@ -129,17 +368,50 @@ export async function createHumanSystem(ctx) {
   function getAnchors() {
     if (anchors) return anchors;
     const c = villageCenter || { x: 0, z: 0 };
-    const one = (cls, fb) => { const s = findReliefSpots(cls, 3); return s[0] ? { x: s[0].x, z: s[0].z } : fb; };
-    anchors = {
-      shore: one('orilla', one('playa', c)),
-      forest: one('llano', one('meseta', c)),
-      mine: one('ladera', one('cima', c)),
-      plaza: c,
+    // elige el sitio de la clase MÁS CERCANO al pueblo (distancias caminables)
+    const one = (cls, fb) => {
+      const s = findReliefSpots(cls, 16); let best = null, bd = Infinity;
+      for (const p of s) { const d = (p.x - c.x) ** 2 + (p.z - c.z) ** 2; if (d < bd) { bd = d; best = { x: p.x, z: p.z }; } }
+      return best || fb;
     };
-    const boat = buildBoat();               // barca en la orilla
-    boat.position.set(anchors.shore.x, Math.max(0, heightAt(anchors.shore.x, anchors.shore.z)) + 0.15, anchors.shore.z);
+    const rawShore = one('orilla', one('playa', c));
+    anchors = {
+      shore: toLand(rawShore.x, rawShore.z),  // los humanos pescan desde tierra (la barca sí va al agua)
+      forest: toLand(one('llano', one('meseta', c)).x, one('llano', one('meseta', c)).z),
+      mine: toLand(one('ladera', one('cima', c)).x, one('ladera', one('cima', c)).z),
+      plaza: toLand(c.x, c.z),
+    };
+    const boat = buildBoat();               // barca en la orilla (sobre el agua, frente a la costa)
+    boat.position.set(rawShore.x, Math.max(0, heightAt(rawShore.x, rawShore.z)) + 0.15, rawShore.z);
     homeGroup.add(boat);
     return anchors;
+  }
+  // rutina diaria según la hora: dormir / trabajar / comer / socializar
+  function dayActivity(time) {
+    if (time < 6 || time >= 21.5) return 'sleep';
+    if ((time >= 12.5 && time < 13.5) || (time >= 19 && time < 21)) return 'eat';
+    if (time >= 6 && time < 8) return 'social';        // despierta, ronda la plaza
+    return 'work';
+  }
+  // destino de un recién llegado: con otros → va donde ellos; primero → a los árboles
+  function gatherTarget() {
+    const others = humans.filter((x) => !x.arriving && x.data.home);
+    if (others.length) { const o = others[(Math.random() * others.length) | 0], a = Math.random() * 6.283, r = 3 + Math.random() * 4; return toLand(o.data.home.x + Math.cos(a) * r, o.data.home.z + Math.sin(a) * r); }
+    const f = getAnchors().forest; return toLand(f.x, f.z);
+  }
+  // paso de caminata que NO entra al agua (si el siguiente paso es agua, replantea destino)
+  function stepLand(h, tx, tz, spd, dt) {
+    const dx = tx - h.px, dz = tz - h.pz, d = Math.hypot(dx, dz);
+    h.t += dt;
+    if (d > 0.5) {
+      const nx = h.px + dx / d * spd * dt, nz = h.pz + dz / d * spd * dt;
+      const cur = heightAt(h.px, h.pz);
+      if (isLand(nx, nz) && Math.abs(heightAt(nx, nz) - cur) < 1.2) { h.px = nx; h.pz = nz; h.mesh.rotation.y = Math.atan2(dx, dz); }   // no salta escalones (barrancos)
+      else { h.retarget = 0; h._gather = null; }   // obstáculo → replantea destino
+    }
+    const gy = Math.max(0, heightAt(h.px, h.pz));
+    h.mesh.position.set(h.px, gy + (d > 0.5 ? Math.abs(Math.sin(h.t * 5)) * 0.05 : 0), h.pz);
+    return d <= 0.5;
   }
   function attachTool(h) {
     if (h.tool) { h.mesh.remove(h.tool); h.tool.traverse((o) => o.geometry?.dispose?.()); h.tool = null; }
@@ -161,12 +433,14 @@ export async function createHumanSystem(ctx) {
     h.home.position.set(h.data.home.x, Math.max(0, heightAt(h.data.home.x, h.data.home.z)) + 0.02, h.data.home.z);
     homeGroup.add(h.home);
   }
-  function spawn(data, animateBuild) {
+  function spawn(data, arriving) {
     const mesh = buildHumanMesh(data.shirt, data.height);
     group.add(mesh);
-    const h = { data, mesh, home: null, tool: null, px: data.home.x, pz: data.home.z, tx: data.home.x, tz: data.home.z, t: Math.random() * 6.283, retarget: 0, building: false, buildT: 0, stage: -1 };
+    let sx, sz;
+    if (arriving) { const sh = getAnchors().shore; sx = sh.x; sz = sh.z; }      // llega por la orilla
+    else { const hp = data.home ? toLand(data.home.x, data.home.z) : toLand(0, 0); data.home = hp; sx = hp.x; sz = hp.z; }
+    const h = { data, mesh, home: null, homeRef: null, builderOf: null, tool: null, px: sx, pz: sz, tx: sx, tz: sz, t: Math.random() * 6.283, retarget: 0, arriving: !!arriving, _gather: null };
     attachTool(h);
-    if (animateBuild) startBuild(h); else rebuildHome(h);   // recién llegado: obra por fases · carga: ya construida
     humans.push(h);
     return h;
   }
@@ -180,9 +454,9 @@ export async function createHumanSystem(ctx) {
         d.tier = tier; d.job = pick(TIERS[tier]);
         attachTool(h);                                 // nueva herramienta del oficio
         const ht = Math.min(3, tier);
-        if (d.homeTier !== ht) { d.homeTier = ht; startBuild(h); }   // re-construye la vivienda mejorada por fases
+        if (d.homeTier !== ht) d.homeTier = ht;   // (las viviendas se gestionan por el registro/etapas)
         dbPut('humans', d);
-        if (announcePrevId && d.id === announcePrevId) toast('⬆️ ' + d.name + ' ascendió a ' + d.job + ' · construyendo nueva casa');
+        if (announcePrevId && d.id === announcePrevId) toast('⬆️ ' + d.name + ' ascendió a ' + d.job);
       }
     }
   }
@@ -190,16 +464,18 @@ export async function createHumanSystem(ctx) {
   async function addFollower(name) {
     const total = humans.length + 1;
     const prevId = humans.length ? humans[humans.length - 1].data.id : null;
-    const home = pickHome(), tier = tierOf(total, total);
+    const tier = tierOf(total, total);
     const data = {
       id: 'h' + total + '-' + Date.now() + '-' + ((Math.random() * 1e6) | 0),
       name: (name || 'Follower ' + total).trim(), arrival: total,
       sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pick(TIERS[tier]), homeTier: Math.min(3, tier),
-      shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25, home,
+      shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25, home: null,   // el hogar se fija al asentarse
     };
     await dbPut('humans', data);
-    spawn(data, true);                      // llega y construye su carpa por fases
+    spawn(data, true);                      // llega y se asienta
     recomputeTiers(prevId);                 // el anterior puede ascender
+    checkCivic();                           // ¿se desbloquea alguna construcción comunitaria?
+    ensureFires();                          // 1 fogata cada ~5 humanos (luz)
     refreshPanel();
     if (MILESTONES.includes(total)) { toast(total === 1 ? '🏆 ¡El primero en tocar tierra! 🌴' : '🏆 ¡Follower nº ' + total + '!'); metaSet('milestone', total); }
     else toast('👤 ' + data.name + ' llegó a la isla (' + total + ')');
@@ -208,8 +484,8 @@ export async function createHumanSystem(ctx) {
   async function removeHuman(id) {
     const i = humans.findIndex((h) => h.data.id === id); if (i < 0) return;
     const h = humans[i];
+    if (h.homeRef) h.homeRef.occ.delete(id);   // libera lugar en la vivienda
     group.remove(h.mesh); h.mesh.traverse((o) => o.geometry?.dispose?.());
-    if (h.home) { homeGroup.remove(h.home); h.home.traverse((o) => o.geometry?.dispose?.()); }
     humans.splice(i, 1);
     await dbDelete('humans', id);
     recomputeTiers(null); refreshPanel();
@@ -220,8 +496,12 @@ export async function createHumanSystem(ctx) {
     await dbPut('humans', h.data); refreshPanel();
   }
   async function resetAll() {
-    for (const h of humans) { group.remove(h.mesh); if (h.home) homeGroup.remove(h.home); }
+    for (const h of humans) group.remove(h.mesh);
     humans.length = 0; villageCenter = null; anchors = null;
+    homesReg.length = 0; builtCivic.clear(); civicBuilds.length = 0;
+    while (civicGroup.children.length) civicGroup.remove(civicGroup.children[0]);
+    for (const f of fires) scene.remove(f.light); fires.length = 0;
+    while (pathGroup.children.length) pathGroup.remove(pathGroup.children[0]); buildingPts.length = 0; pathGrows.length = 0;
     await dbClear('humans'); refreshPanel();
   }
 
@@ -231,44 +511,94 @@ export async function createHumanSystem(ctx) {
     const night = time < 6 || time > 20.5;
     const cx = camera.position.x, cz = camera.position.z;
     const cull2 = (ctx.cullDist || SIZE * 0.6) ** 2;
+    updateCivicBuilds(dt);                              // obras comunitarias se levantan
+    updateHomeBuilds(dt);                               // viviendas se levantan por fases
+    updatePaths(dt);                                    // caminos se van marcando
     for (const h of humans) {
-      // progreso de obra (avanza siempre, aunque esté lejos o de noche)
-      if (h.building) {
-        const tt = h.data.homeTier || 0, stages = STAGES[tt], total = BUILD_TIME[tt];
-        h.buildT += dt;
-        const pr = Math.min(1, h.buildT / total), st = Math.min(stages - 1, Math.floor(pr * stages));
-        if (st !== h.stage) { h.stage = st; rebuildHome(h, st); }
-        if (pr >= 1) { h.building = false; rebuildHome(h, stages - 1); }
+      if (h.arriving) {                                 // recién llegado: ¿hay otros? va con ellos; si no, a los árboles
+        h.mesh.visible = true;
+        if (!h._gather) h._gather = gatherTarget();
+        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt)) { h.arriving = false; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // se asienta en tierra
+        continue;
       }
+      if (buildEra > 0 && !h.homeRef) assignHome(h);     // ¿hay etapa activa? consigue/levanta vivienda
+      if (h.builderOf && !h.builderOf.building) h.builderOf = null;   // terminó de construir
+      const building = !!h.builderOf;
+      const act = building ? 'build' : dayActivity(time);            // rutina del día
+      if (act === 'work') { const p = PROD[h.data.job]; if (p) for (const k in p) resources[k] += p[k] * dt; }   // produce mientras trabaja
       const dxc = h.px - cx, dzc = h.pz - cz;
-      const far = dxc * dxc + dzc * dzc > cull2;
-      if (h.home) h.home.visible = !far;
+      const far = dxc * dxc + dzc * dzc > cull2 && h.data.id !== followId;
       if (far) { h.mesh.visible = false; continue; }
-      const sleeping = night && !h.data.nightOwl && !h.building;   // si construye, no duerme
-      if (sleeping) { h.mesh.visible = false; continue; }   // durmiendo dentro de su casa
+      // NECESIDADES (suben con el tiempo) → ánimo
+      h.hunger = Math.min(1, (h.hunger || 0) + dt * 0.004);
+      h.energy = Math.min(1, (h.energy || 0) + dt * 0.003);
+      h.social = Math.min(1, (h.social || 0) + dt * 0.0035);
+      const canSleep = h.homeRef && !h.homeRef.building;    // solo duerme quien tiene vivienda terminada
+      const sleeping = act === 'sleep' && canSleep && !h.data.nightOwl && !building && h.data.id !== followId;
+      if (sleeping) { h.energy = Math.max(0, h.energy - dt * 0.06); h.mesh.visible = false; if (h.say) { h.mesh.remove(h.say.sp); h.say = null; } continue; }   // descansa
       h.mesh.visible = true;
+      if (act === 'eat') h.hunger = Math.max(0, h.hunger - dt * 0.04);                 // comiendo
+      if (act === 'social' || act === 'eat' || h.say) h.social = Math.max(0, h.social - dt * 0.03);   // acompañado
       h.retarget -= dt;
-      if (h.retarget <= 0) {
+      if (h.retarget <= 0 || building) {
         h.retarget = 3 + Math.random() * 4;
-        const base = h.building ? h.data.home : (night ? h.data.home : anchorFor(h.data.job));   // construye en su lote · de día al trabajo
-        const a = Math.random() * 6.283, r = SIZE * 0.012 * Math.random();
-        h.tx = base.x + Math.cos(a) * r; h.tz = base.z + Math.sin(a) * r;
+        let base;
+        if (building) base = h.builderOf;                                          // levanta su casa
+        else if (act === 'eat') base = civicPos.mercado || civicPos.fogata || getAnchors().plaza;   // comer en mercado/fogata
+        else if (act === 'work') base = anchorFor(h.data.job);                     // a su oficio
+        else base = h.homeRef || h.data.home || getAnchors().plaza;                // dormir/socializar cerca de casa/plaza
+        const a = Math.random() * 6.283, r = building ? 1.5 : SIZE * 0.012 * Math.random();
+        const t = toLand(base.x + Math.cos(a) * r, base.z + Math.sin(a) * r);
+        h.tx = t.x; h.tz = t.z;
       }
-      const dx = h.tx - h.px, dz = h.tz - h.pz, d = Math.hypot(dx, dz);
-      const spd = 0.6 + (h.data.personality === 'Aventurero' ? 0.5 : 0);
-      h.t += dt;
-      if (d > 0.4) {                                    // caminando
-        h.px += dx / d * spd * dt; h.pz += dz / d * spd * dt;
-        h.mesh.rotation.y = Math.atan2(dx, dz);
-        const gy = Math.max(0, heightAt(h.px, h.pz));
-        h.mesh.position.set(h.px, gy + Math.abs(Math.sin(h.t * 6)) * 0.04, h.pz);
-      } else {                                          // trabajando en el sitio (pequeña animación)
-        const gy = Math.max(0, heightAt(h.px, h.pz));
-        h.mesh.position.set(h.px, gy + Math.abs(Math.sin(h.t * 4)) * 0.02, h.pz);
-        h.mesh.rotation.y += Math.sin(h.t * 3) * 0.04;
+      const spd = WALK + (h.data.personality === 'Aventurero' ? 0.4 : 0);   // caminata realista, sin pisar agua
+      if (stepLand(h, h.tx, h.tz, spd, dt)) h.mesh.rotation.y += Math.sin(h.t * 3) * 0.03;   // en el sitio → actividad
+      updateSpeech(h, dt);   // globito de diálogo (tipeo + sonido)
+    }
+    // seguir a un humano: trasladamos TODO el rig (cámara + objetivo) lo que se movió él → seguimiento suave,
+    // y el usuario puede girar/zoom alrededor con el mouse (no le peleamos el control).
+    if (followId && controls) {
+      const h = humans.find((x) => x.data.id === followId);
+      if (h) {
+        const p = h.mesh.position;
+        if (_followPrev) {
+          const dx = p.x - _followPrev.x, dy = p.y - _followPrev.y, dz = p.z - _followPrev.z;
+          controls.target.x += dx; controls.target.y += dy; controls.target.z += dz;
+          camera.position.x += dx; camera.position.y += dy; camera.position.z += dz;
+          _followPrev.copy(p);
+        } else _followPrev = p.clone();
+      } else { followId = null; _followPrev = null; }
+    }
+    // diálogos: cada tanto alguien dice algo según su ánimo; si hay alguien cerca, le responde
+    talkT -= dt;
+    if (talkT <= 0) {
+      talkT = 1.6 + Math.random() * 2.8;
+      const cands = humans.filter((h) => h.mesh.visible && !h.say && !h.arriving);
+      if (cands.length) {
+        const sp = cands[(Math.random() * cands.length) | 0], set = LINES[needKey(sp)];
+        say(sp, set[(Math.random() * set.length) | 0]);
+        let nb = null, bd = 36;
+        for (const o of cands) { if (o === sp || o.say) continue; const dx = o.px - sp.px, dz = o.pz - sp.pz, d = dx * dx + dz * dz; if (d < bd) { bd = d; nb = o; } }
+        if (nb) { sp.mesh.rotation.y = Math.atan2(nb.px - sp.px, nb.pz - sp.pz); nb.mesh.rotation.y = Math.atan2(sp.px - nb.px, sp.pz - nb.pz); say(nb, REPLIES[(Math.random() * REPLIES.length) | 0], 1.2); }
       }
     }
+    // guarda recursos y refresca el marcador cada ~4s
+    prodSaveT += dt;
+    if (prodSaveT > 4) { prodSaveT = 0; metaSet('resources', resources); updateResLine(); }
   }
+  function setFollow(id) {
+    followId = id; const h = humans.find((x) => x.data.id === id);
+    if (h && controls) {                       // zoom inicial a 3ra persona (detrás); luego el usuario gira/zoom libre
+      const p = h.mesh.position, ry = h.mesh.rotation.y, dist = 6, hgt = 3;
+      controls.target.set(p.x, p.y + 1.2, p.z);
+      camera.position.set(p.x - Math.sin(ry) * dist, p.y + hgt, p.z - Math.cos(ry) * dist);
+      if (controls.update) controls.update();
+      _followPrev = p.clone();
+      toast('🎥 Siguiendo a ' + h.data.name + ' · girá alrededor con clic-DER');
+    }
+    refreshPanel();
+  }
+  function clearFollow() { followId = null; _followPrev = null; refreshPanel(); }
 
   // ---- panel de gestión (DOM, izquierda) ----
   const panel = document.createElement('div');
@@ -293,31 +623,53 @@ export async function createHumanSystem(ctx) {
 
   function nextMilestone(n) { return MILESTONES.find((m) => m > n) || null; }
   function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function resText() { return Object.keys(RES_ICON).map((k) => RES_ICON[k] + ' ' + Math.floor(resources[k])).join('   '); }
+  function updateResLine() { const el = panel.querySelector('#sim-res'); if (el) el.textContent = resText(); }
   function refreshPanel() {
     if (panel.style.display === 'none') return;
     const n = humans.length, nm = nextMilestone(n);
     let html = '<div class="ap-head"><span>🏝️ Isla · Followers</span><button id="sim-close">✕</button></div>';
     html += `<div class="stat">Población: <b>${n}</b>${nm ? ' · próximo hito: ' + nm : ''}</div>`;
+    html += `<div class="stat" id="sim-res">${resText()}</div>`;
     html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
+    const eras = ['Sin construir', 'Campamento (carpas)', 'Aldea (chozas)', 'Pueblo (cabañas)', 'Ciudad (casas)'];
+    html += '<div class="stat" style="margin-top:8px;">🏗️ Etapa de construcción</div>';
+    html += `<select id="sim-era" style="width:100%;margin:2px 0 6px;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">` +
+      eras.map((l, i) => `<option value="${i}"${i === buildEra ? ' selected' : ''}>${l}</option>`).join('') + '</select>';
+    html += `<input id="sim-search" placeholder="🔍 buscar @nombre" value="${escapeHtml(searchQ)}" style="width:100%;margin:5px 0;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">`;
+    if (followId) { const fh = humans.find((x) => x.data.id === followId); if (fh) html += `<div class="stat" style="display:flex;justify-content:space-between;align-items:center;">🎥 Siguiendo a <b>${escapeHtml(fh.data.name)}</b> <button id="sim-unfollow">⏹</button></div>`; }
     html += '<div id="sim-list">';
-    const list = humans.slice().sort((a, b) => b.data.arrival - a.data.arrival).slice(0, 60);
+    const list = humans.slice().sort((a, b) => b.data.arrival - a.data.arrival).slice(0, 200);
     for (const h of list) {
       const d = h.data, rank = RANK_NAMES[d.tier ?? 0];
-      html += `<div class="h-item"><div class="hn">#${d.arrival} ${escapeHtml(d.name)}</div>` +
+      html += `<div class="h-item" data-name="${escapeHtml(('#' + d.arrival + ' ' + d.name).toLowerCase())}"><div class="hn">${MOOD_EMOJI[needKey(h)]} #${d.arrival} ${escapeHtml(d.name)}</div>` +
         `<div class="hr">${rank} · ${d.job} · ${d.sign} · ${d.personality}${d.nightOwl ? ' · 🌙' : ''}</div>` +
-        `<div class="acts"><button data-reroll="${d.id}" title="Cambiar signo/personalidad">🎲</button>` +
+        `<div class="acts"><button data-follow="${d.id}" title="Seguir con la cámara">👁</button>` +
+        `<button data-reroll="${d.id}" title="Cambiar signo/personalidad">🎲</button>` +
         `<button data-del="${d.id}" title="Quitar">✕</button></div></div>`;
     }
-    if (n > 60) html += `<div class="stat">… y ${n - 60} más</div>`;
+    if (n > 200) html += `<div class="stat">… y ${n - 200} más (usá el buscador)</div>`;
     html += '</div>';
     if (n) html += '<button class="full" id="sim-reset" style="margin-top:8px;background:rgba(140,50,55,.5)">🗑 Reiniciar isla</button>';
     panel.innerHTML = html;
+    applyFilter();
   }
+  function applyFilter() { const q = searchQ.trim().toLowerCase(); panel.querySelectorAll('.h-item').forEach((el) => { el.style.display = (!q || el.dataset.name.includes(q)) ? '' : 'none'; }); }
+  panel.addEventListener('input', (e) => { if (e.target.id === 'sim-search') { searchQ = e.target.value; applyFilter(); } });
+  panel.addEventListener('change', (e) => {
+    if (e.target.id === 'sim-era') {
+      buildEra = +e.target.value; metaSet('buildEra', buildEra); checkCivic();
+      toast(buildEra ? 'Etapa: ' + e.target.options[e.target.selectedIndex].text : 'Construcción detenida');
+    }
+  });
   panel.addEventListener('click', async (e) => {
+    initAudio();                               // habilita el sonido de los diálogos (gesto del usuario)
     const b = e.target.closest('button'); if (!b) return;
     if (b.id === 'sim-close') { hidePanel(); return; }
     if (b.id === 'sim-add') { const name = prompt('Nombre / @handle del follower:', 'Follower ' + (humans.length + 1)); if (name !== null) await addFollower(name); return; }
     if (b.id === 'sim-reset') { if (confirm('¿Borrar todos los followers de la isla?')) await resetAll(); return; }
+    if (b.id === 'sim-unfollow') { clearFollow(); return; }
+    if (b.dataset.follow) { setFollow(b.dataset.follow); return; }
     if (b.dataset.del) { await removeHuman(b.dataset.del); return; }
     if (b.dataset.reroll) { await reroll(b.dataset.reroll); return; }
   });
@@ -326,10 +678,12 @@ export async function createHumanSystem(ctx) {
   function togglePanel() { panel.style.display === 'none' ? showPanel() : hidePanel(); }
 
   // carga inicial desde la DB
+  const savedRes = await metaGet('resources', null); if (savedRes) Object.assign(resources, savedRes);
+  buildEra = await metaGet('buildEra', 0);
   const saved = (await dbGetAll('humans')).sort((a, b) => a.arrival - b.arrival);
   for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d, false); }
-  if (saved.length) recomputeTiers(null);   // normaliza niveles/viviendas de datos viejos
+  if (saved.length) { recomputeTiers(null); checkCivic(true); ensureFires(); }   // normaliza, reconstruye lo comunitario y las fogatas
 
-  function dispose() { scene.remove(group); scene.remove(homeGroup); panel.remove(); styleEl.remove(); }
+  function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const f of fires) scene.remove(f.light); panel.remove(); styleEl.remove(); }
   return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, dispose, count: () => humans.length };
 }

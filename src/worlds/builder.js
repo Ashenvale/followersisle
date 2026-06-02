@@ -32,13 +32,13 @@ export async function create({ renderer, mode }) {
     mar: true,
     wireframe: false,
     heatmap: false,         // vista de clasificación de relieve (playa/acantilado/barranco/…)
-    timeOfDay: 9,           // hora del día (0-24); controla sol, luna y estrellas
-    dayCycle: true,         // avanzar la hora automáticamente
+    timeOfDay: 13,          // hora del día (0-24); por defecto MEDIODÍA y congelada
+    dayCycle: false,        // por defecto NO avanza (la última selección queda fija)
     daySeconds: 120,        // duración de un día completo (s)
     moonPhase: 0.5,         // 0 luna nueva · 0.5 llena · 1 nueva otra vez
-    moonCycle: true,        // avanzar las fases de la luna automáticamente
-    season: 0.05,           // 0 primavera · 0.25 verano · 0.5 otoño · 0.75 invierno
-    seasonCycle: true,      // avanzar las estaciones automáticamente
+    moonCycle: false,       // por defecto NO avanza
+    season: 0.2,            // verano por defecto
+    seasonCycle: false,     // por defecto NO avanza
     seasonSeconds: 240,     // duración de un año completo (s)
     weather: true,          // clima localizado (nubes/lluvia/niebla por zonas)
     weatherAmount: 0.5,     // 0 despejado … 1 muy cubierto (densidad de celdas)
@@ -49,7 +49,13 @@ export async function create({ renderer, mode }) {
     cineW: 1920, cineH: 1080, // resolución personalizada
     filter: 'Ninguno',      // filtro de color (look): Realista, Cinemático, etc.
   };
-  // en la sección Cinemática los ciclos arrancan APAGADOS: todo se controla con keyframes
+  // persistencia: la ÚLTIMA selección (hora, clima, etc.) queda guardada y se restaura en todos lados
+  const SETTINGS_KEY = 'evermark_settings_v1';
+  const SETTINGS_KEYS = ['timeOfDay', 'dayCycle', 'daySeconds', 'moonPhase', 'moonCycle', 'season', 'seasonCycle', 'seasonSeconds', 'weather', 'weatherAmount', 'windSpeed', 'shoreWaves', 'filter', 'sceneSegSecs', 'cineFormat'];
+  function loadSettings() { try { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); if (s) for (const k of SETTINGS_KEYS) if (k in s) params[k] = s[k]; } catch (e) {} }
+  function saveSettings() { try { const o = {}; for (const k of SETTINGS_KEYS) o[k] = params[k]; localStorage.setItem(SETTINGS_KEY, JSON.stringify(o)); } catch (e) {} }
+  loadSettings();
+  // en la sección Cinemática los ciclos arrancan APAGADOS (el guion los maneja con keyframes)
   if (CINE_MODE) { params.dayCycle = false; params.moonCycle = false; params.seasonCycle = false; }
 
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -1477,6 +1483,20 @@ export async function create({ renderer, mode }) {
     const t = inst[key]; if (!t) return;
     t.alive[id] = 0; t.free.push(id); instDirty = true;
   }
+  // ÁRBOLES REALES (madera): árbol/pino/palmera, NO flores ni frutales. Para el leñador de la simulación.
+  function realTreeNear(x, z, maxR) {
+    let best = null, bestD = (maxR || 1e9) ** 2;
+    for (const key of ['arbol', 'pino', 'palmera']) {
+      const t = inst[key]; if (!t) continue;
+      for (let id = 0; id < t.count; id++) {
+        if (!t.alive[id]) continue;
+        const dx = t.px[id] - x, dz = t.pz[id] - z, d = dx * dx + dz * dz;
+        if (d < bestD) { bestD = d; best = { key, id, x: t.px[id], z: t.pz[id] }; }
+      }
+    }
+    return best;
+  }
+  function fellTree(ref) { if (ref) removeInstance(ref.key, ref.id); }   // tala: el árbol desaparece
   function resetInstances() {
     for (const k in inst) {
       const t = inst[k];
@@ -2403,6 +2423,7 @@ export async function create({ renderer, mode }) {
   fCM.add({ stop: stopScene }, 'stop').name('⏹ Detener');
   fCM.add({ clr: clearScene }, 'clr').name('🗑 Limpiar escena');
   if (CINE_MODE) fCM.hide();   // en la sección Cinemática usamos el panel izquierdo dedicado
+  gui.onChange(saveSettings);  // cualquier cambio en el panel se guarda (la última selección queda fija)
 
   // reloj + nombre de la fase lunar en pantalla
   const clockEl = document.createElement('div');
@@ -2861,7 +2882,7 @@ export async function create({ renderer, mode }) {
   // ---- followers / humanos (simulación con DB) ----
   try {
     humanSys = await createHumanSystem({
-      scene, camera, heightAt, findReliefSpots, SIZE, toast,
+      scene, camera, controls, heightAt, findReliefSpots, terrainClassAt, SIZE, toast,
       getTime: () => params.timeOfDay, cullDist: SIZE * 0.6,
     });
     if (MANAGE_MODE) humanSys.showPanel();
