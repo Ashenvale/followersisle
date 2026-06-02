@@ -6,11 +6,18 @@ import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { createHumanSystem } from '../sim/humans.js';
 
 // MUNDO 3 — Constructor de terreno con tamaño elegible (hasta varios km).
 // El lienzo es el océano: levantas tierra con el pincel y se forman playas/acantilados.
 //   Clic-izq = esculpir/colocar · clic-DER = orbitar · arrastrar rueda = mover · girar rueda = zoom
-export async function create({ renderer }) {
+export async function create({ renderer, mode }) {
+  const CINE_MODE = mode === 'cinematic';   // sección dedicada: oculta edición, enfoca clima/tiempo/escenas
+  const MANAGE_MODE = mode === 'manage';    // sección Isla/Gestión: followers, trabajos, ciclos
   const params = {
     sizeKm: 1,              // tamaño del mapa (km)
     coverage: 35,           // % del mapa cubierto por tierra al generar
@@ -36,7 +43,14 @@ export async function create({ renderer }) {
     weather: true,          // clima localizado (nubes/lluvia/niebla por zonas)
     weatherAmount: 0.5,     // 0 despejado … 1 muy cubierto (densidad de celdas)
     shoreWaves: true,       // olas/espuma rompiendo en la orilla
+    windSpeed: 0.4,         // 0 calma … 1 vendaval; mece árboles cercanos y olas, y arrastra el clima
+    sceneSegSecs: 5,        // segundos por plano en las escenas scripted de cinemática
+    cineFormat: '1080p 16:9', // formato/resolución de grabación
+    cineW: 1920, cineH: 1080, // resolución personalizada
+    filter: 'Ninguno',      // filtro de color (look): Realista, Cinemático, etc.
   };
+  // en la sección Cinemática los ciclos arrancan APAGADOS: todo se controla con keyframes
+  if (CINE_MODE) { params.dayCycle = false; params.moonCycle = false; params.seasonCycle = false; }
 
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
@@ -45,6 +59,43 @@ export async function create({ renderer }) {
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 200000);
+
+  // ===== POST-PROCESO: filtros de color (look) que se hornean también en la grabación =====
+  const composer = new EffectComposer(renderer);
+  composer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  composer.setSize(innerWidth, innerHeight);
+  composer.addPass(new RenderPass(scene, camera));
+  composer.addPass(new OutputPass());                 // tonemapping ACES + sRGB
+  const gradePass = new ShaderPass({
+    uniforms: { tDiffuse: { value: null }, uSat: { value: 1 }, uCon: { value: 1 }, uBri: { value: 1 }, uTint: { value: new THREE.Color(1, 1, 1) }, uVig: { value: 0 } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform sampler2D tDiffuse; uniform float uSat; uniform float uCon; uniform float uBri; uniform vec3 uTint; uniform float uVig; varying vec2 vUv;\n' +
+      'void main(){ vec4 c = texture2D(tDiffuse, vUv); vec3 col = c.rgb * uBri * uTint;\n' +
+      '  float l = dot(col, vec3(0.299,0.587,0.114)); col = mix(vec3(l), col, uSat);\n' +
+      '  col = (col - 0.5) * uCon + 0.5;\n' +
+      '  col *= 1.0 - uVig * smoothstep(0.30, 0.85, distance(vUv, vec2(0.5)));\n' +
+      '  gl_FragColor = vec4(clamp(col, 0.0, 1.0), c.a); }',
+  });
+  composer.addPass(gradePass);                         // grading sobre la imagen final
+  const GRADE_PRESETS = {
+    'Ninguno':    { sat: 1.0, con: 1.0,  bri: 1.0,  tint: [1, 1, 1],          vig: 0.0 },
+    'Realista':   { sat: 1.12, con: 1.08, bri: 1.0,  tint: [1.0, 1.0, 1.0],   vig: 0.15 },
+    'Cinemático': { sat: 1.05, con: 1.16, bri: 0.98, tint: [1.04, 1.0, 0.94], vig: 0.38 },
+    'Cálido':     { sat: 1.12, con: 1.06, bri: 1.02, tint: [1.12, 1.02, 0.9], vig: 0.22 },
+    'Frío':       { sat: 1.0,  con: 1.06, bri: 1.0,  tint: [0.9, 0.98, 1.14], vig: 0.22 },
+    'Vintage':    { sat: 0.7,  con: 0.95, bri: 1.03, tint: [1.12, 1.0, 0.82], vig: 0.42 },
+    'Blanco y negro': { sat: 0.0, con: 1.22, bri: 1.0, tint: [1, 1, 1],       vig: 0.36 },
+    'Vívido':     { sat: 1.42, con: 1.12, bri: 1.0,  tint: [1, 1, 1],         vig: 0.1 },
+  };
+  function applyFilter() {
+    const g = GRADE_PRESETS[params.filter] || GRADE_PRESETS['Ninguno'];
+    const u = gradePass.uniforms;
+    u.uSat.value = g.sat; u.uCon.value = g.con; u.uBri.value = g.bri; u.uVig.value = g.vig;
+    u.uTint.value.setRGB(g.tint[0], g.tint[1], g.tint[2]);
+    // 'Ninguno' = valores identidad → el pass queda activo pero deja la imagen igual (no deshabilitar: rompe la salida)
+  }
+  applyFilter();
+  function renderFrame() { composer.render(); }        // el shell y el render offline dibujan por acá
 
   // ===== CICLO DÍA/NOCHE: sol, luna con fases y estrellas, todo en función de params.timeOfDay =====
   const TWO_PI = Math.PI * 2;
@@ -204,6 +255,7 @@ export async function create({ renderer }) {
   let seasonSnowY = 1e9;        // cota de la línea de nieve (cambia con la estación; nieve solo por encima)
   let lakeMask = null;          // 1 en celdas de LAGO (agua dulce) → humedad más fuerte que los ríos
   let wetField = null;          // 0..1 proximidad al agua (alto cerca de agua, decae con la distancia)
+  let lakeField = null, riverField = null;   // influencia separada de lagos (→bosque) y ríos (→selva)
   let lakeInfo = [];            // {x,z,level,r} por lago → peces de lago (varios tamaños)
   let riverPts = [];            // {x,z,y} puntos de cauce a BAJA altura (no montaña) → peces chiquitos de río
 
@@ -241,7 +293,8 @@ export async function create({ renderer }) {
   function clearPropGrid() { resetInstances(); propGrid.clear(); }
   // separación FIJA (no depende de la densidad → la rejilla es estable y borrar/repintar
   // siempre encuentra las instancias). La densidad controla la probabilidad de sembrar.
-  function propSpacing() { return Math.max(2.4, SIZE / 440); }
+  // espaciado de siembra: crece con el mapa pero con TOPE → islas grandes no quedan ralas (antes SIZE/440 = ~11 m en 5 km)
+  function propSpacing() { return Math.max(2.4, Math.min(5.5, SIZE / 800)); }
 
   function configureForSize() {
     SIZE = params.sizeKm * 1000;
@@ -614,6 +667,13 @@ export async function create({ renderer }) {
         else if (m > 0.28) b = 'sabana';
         else b = 'desierto';
       }
+      // INFLUENCIA DEL AGUA DULCE: cerca de RÍOS → selva (galería); cerca de LAGOS → bosque frondoso.
+      // Solo sobre tierra plantable (no roca/nieve/playa/manglar/cumbre).
+      if (b !== 'roca' && b !== 'nieve' && b !== 'playa' && b !== 'pantano' && e <= 0.55 && slope < 1.0) {
+        const rv = riverField ? riverField[idx] : 0, lk = lakeField ? lakeField[idx] : 0;
+        if (rv > 0.5 && rv >= lk && temp > 0.42) b = 'selva';        // ribera fluvial cálida → selva
+        else if (lk > 0.5 && temp >= 0.3) b = 'bosque';              // entorno de lago → bosque
+      }
       biomes[idx] = idxOf(b);
     }
   }
@@ -695,15 +755,12 @@ export async function create({ renderer }) {
   }
   // campo de "humedad": fuerte sobre los LAGOS (agua dulce → más vida), medio en ríos y mar; decae con
   // la distancia. Al sembrar los lagos más alto, su influencia llega MÁS LEJOS que la de los ríos.
-  function computeWetField() {
+  // difunde un campo 0..1 desde sus semillas (decae con la distancia) → zonas de influencia
+  function spreadField(seed, passes) {
     const f = new Float32Array(N * N);
-    for (let k = 0; k < N * N; k++) {
-      if (lakeMask[k]) f[k] = 1.0;           // lago: humedad fuerte y de largo alcance
-      else if (waterMask[k]) f[k] = 0.72;    // río: un poquito menos vegetación que el lago
-      else if (height[k] < 0) f[k] = 0.55;   // mar / costa sumergida
-    }
+    for (let k = 0; k < N * N; k++) f[k] = seed(k);
     const decay = 0.9;
-    for (let p = 0; p < 26; p++) {
+    for (let p = 0; p < passes; p++) {
       const b = f.slice();
       for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
         const idx = y * N + x;
@@ -718,7 +775,13 @@ export async function create({ renderer }) {
       }
       f.set(b);
     }
-    wetField = f;
+    return f;
+  }
+  function computeWetField() {
+    // humedad general (vegetación) + influencia separada de LAGOS y de RÍOS (para sesgar el bioma)
+    wetField = spreadField((k) => lakeMask[k] ? 1.0 : waterMask[k] ? 0.72 : (height[k] < 0 ? 0.55 : 0), 26);
+    lakeField = spreadField((k) => lakeMask[k] ? 1.0 : 0, 22);                       // cerca de lagos → bosque
+    riverField = spreadField((k) => (waterMask[k] && !lakeMask[k]) ? 1.0 : 0, 22);   // cerca de ríos → selva
   }
   // mezcla el relieve con una versión difuminada (amount 0..1) → suaviza picos sin aplanar los macizos
   function smoothHeights(amount) {
@@ -1139,6 +1202,32 @@ export async function create({ renderer }) {
   // Reemplazan a los GLB (que eran ~3k tris/árbol): ahora ~40-120 tris cada uno → muchísimo más
   // barato, así podemos sembrarlos MÁS DENSOS. flatShading da el aspecto facetado lowpoly.
   const plantMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.92, metalness: 0 });
+  // nieve en la vegetación: blanquea (en world-space) cualquier planta por encima de la línea de nieve en invierno.
+  // Funciona también con InstancedMesh (no hace falta tocar instancia por instancia).
+  const snowUniforms = { uSnowY: { value: 1e9 }, uSnowBand: { value: 30 }, uSnowAmt: { value: 0 } };
+  // viento: mece el follaje CERCANO (los lejanos quedan quietos por rendimiento y claridad)
+  const windUniforms = {
+    uWindTime: { value: 0 }, uWindStr: { value: 0 }, uWindDir: { value: new THREE.Vector2(1, 0) },
+    uWindCam: { value: new THREE.Vector3() }, uWindNear: { value: 100 }, uWindFar: { value: 300 },
+  };
+  plantMat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, snowUniforms, windUniforms);
+    shader.vertexShader = 'varying float vSnowWY;\nuniform float uWindTime;\nuniform float uWindStr;\nuniform vec2 uWindDir;\nuniform vec3 uWindCam;\nuniform float uWindNear;\nuniform float uWindFar;\n' +
+      shader.vertexShader.replace('#include <begin_vertex>',
+        '#include <begin_vertex>\n' +
+        '#ifdef USE_INSTANCING\n  vec3 _wp0 = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;\n#else\n  vec3 _wp0 = (modelMatrix * vec4(transformed, 1.0)).xyz;\n#endif\n' +
+        '  float _near = 1.0 - smoothstep(uWindNear, uWindFar, length(_wp0.xz - uWindCam.xz));\n' +
+        '  float _lever = max(transformed.y, 0.0);\n' +
+        '  float _ph = _wp0.x * 0.12 + _wp0.z * 0.12;\n' +
+        '  float _sw = sin(uWindTime * 1.3 + _ph) + 0.3 * sin(uWindTime * 3.3 + _ph * 2.0);\n' +
+        '  float _amp = uWindStr * _lever * _near;\n' +
+        '  transformed.x += uWindDir.x * _sw * _amp;\n  transformed.z += uWindDir.y * _sw * _amp;\n' +
+        '#ifdef USE_INSTANCING\n  vSnowWY = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).y;\n#else\n  vSnowWY = (modelMatrix * vec4(transformed, 1.0)).y;\n#endif');
+    shader.fragmentShader = 'varying float vSnowWY;\nuniform float uSnowY;\nuniform float uSnowBand;\nuniform float uSnowAmt;\n' + shader.fragmentShader.replace(
+      '#include <dithering_fragment>',
+      '#include <dithering_fragment>\n  float _snow = smoothstep(uSnowY, uSnowY + uSnowBand, vSnowWY) * uSnowAmt;\n  gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.95, 0.96, 1.0), _snow);');
+  };
+  plantMat.customProgramCacheKey = () => 'snowwindveg';
   const C = { bark: [0.40, 0.27, 0.16], palmBark: [0.46, 0.38, 0.22], pine: [0.12, 0.40, 0.20], tree: [0.17, 0.46, 0.24], palm: [0.20, 0.52, 0.26], bush: [0.22, 0.45, 0.20], cactus: [0.26, 0.50, 0.30], rock: [0.46, 0.44, 0.40], tan: [0.56, 0.50, 0.40], grass: [0.30, 0.52, 0.22], grass2: [0.42, 0.60, 0.26],
     fruitLeaf: [0.21, 0.49, 0.25], fruit: [0.78, 0.16, 0.12], fruitO: [0.93, 0.51, 0.10], fruitP: [0.52, 0.18, 0.52],
     blossom: [0.93, 0.62, 0.72], blossom2: [0.98, 0.84, 0.89] };
@@ -1334,7 +1423,7 @@ export async function create({ renderer }) {
   //   · distancia máx.  → no dibujamos specks lejanos (params.vegDist)
   //   · LOD por distancia → muy cerca = modelo de alta calidad, cerca = medio, lejos = impostor ultra-lowpoly
   const UP = new THREE.Vector3(0, 1, 0);
-  const INST_MAX = 60000;                              // capacidad lógica por tipo (arrays de instancias)
+  const INST_MAX = 120000;                             // capacidad lógica por tipo (sube para densificar mapas grandes)
   const CAP_HI = 8000, CAP_NEAR = 30000, CAP_FAR = 60000;  // capacidad GPU por tier (lo visible en cada banda)
   const _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
   // impostor lejano: blob de pocos tris con el color medio del modelo, estirado a su silueta
@@ -1433,18 +1522,21 @@ export async function create({ renderer }) {
   }
 
   let placed = [];
+  let placedRecords = [];   // {key,x,y,z,rot} de TODO lo colocado → para guardar/recargar la isla completa
   let selKind = 'nav', selKey = null, paletteEl = null;   // arranca en NAVEGAR (no edita al primer clic)
   const ANIMAL_KEYS = new Set(['ave', 'pez', 'delfin', 'tiburon', 'ballena']);
-  function placeAsset(key, x, y, z) {
+  function placeAsset(key, x, y, z, rot) {
+    const r = (rot == null) ? Math.random() * Math.PI * 2 : rot;
+    placedRecords.push({ key, x, y, z, rot: r });
     if (ANIMAL_KEYS.has(key)) { spawnPlacedAnimal(key, x, y, z); return; }   // los animales cobran vida, no se colocan estáticos
     const obj = assetDefs[key].make();
-    obj.rotation.y = Math.random() * Math.PI * 2;
+    obj.rotation.y = r;
     obj.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(obj);
     obj.position.set(x, y - box.min.y, z);
     scene.add(obj); placed.push(obj);
   }
-  function clearPlaced() { for (const o of placed) scene.remove(o); placed = []; }
+  function clearPlaced() { for (const o of placed) scene.remove(o); placed = []; placedRecords = []; }
 
   // Reparte aleatoriamente los assets que tenemos sobre la tierra generada.
   function randLand(minH, maxH) {
@@ -1821,7 +1913,7 @@ export async function create({ renderer }) {
     }
     // --- PECES DE LAGO: varios tamaños, saltan cada tanto ---
     for (const L of lakeInfo) {
-      const n = 2 + (Math.random() * 3 | 0);
+      const n = THREE.MathUtils.clamp(Math.round(L.r / 6), 2, 18);   // más peces en lagos más grandes
       for (let k = 0; k < n; k++) {
         const size = 0.15 + Math.random() * 0.13;      // ~0.35-0.6 m (real)
         const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]);
@@ -1914,7 +2006,10 @@ export async function create({ renderer }) {
       d.g.rotation.y = Math.atan2(-Math.cos(d.ang) * sgn, -Math.sin(d.ang) * sgn);
       d.g.rotation.z = Math.cos(ph) * 0.9;             // morro arriba al subir, abajo al bajar
     }
+    const fcull2 = params.vegDist * params.vegDist;   // peces lejanos no se renderizan
     for (const f of fishes) {                   // peces: nadan visibles a ras de superficie y saltan cada tanto
+      const dxc = f.cx - camera.position.x, dzc = f.cz - camera.position.z;
+      if (dxc * dxc + dzc * dzc > fcull2) { f.g.visible = false; continue; }
       if (f.hd === undefined) {                  // init perezoso del crucero
         f.hd = Math.random() * 6.283; f.px = f.cx; f.pz = f.cz; f.phase = Math.random() * 6.283; f.t2 = 0;
       }
@@ -1964,9 +2059,13 @@ export async function create({ renderer }) {
     else { const k = (s - 0.75) / 0.25; tr = 0.72 + 0.08 * k; tg = 0.42 + 0.53 * k; tb = 0.33 + 0.45 * k; }        // invierno → primavera
     _foliageTint.setRGB(tr, tg, tb);
     plantMat.color.copy(_foliageTint);
+    // árboles a la altura de la nieve se vuelven blancos (sobre todo en otoño tardío/invierno)
+    snowUniforms.uSnowY.value = seasonSnowY - LAND_MAX * 0.04;   // empieza un poco por debajo del manto del terreno
+    snowUniforms.uSnowBand.value = LAND_MAX * 0.12;
+    snowUniforms.uSnowAmt.value = Math.max(0, cold - 0.15) / 0.85;   // aparece cuando refresca, pleno en invierno
   }
   function updateSeason(dt) {
-    if (params.seasonCycle) params.season = (params.season + dt / params.seasonSeconds) % 1;
+    if (params.seasonCycle && !scenePlaying) params.season = (params.season + dt / params.seasonSeconds) % 1;
     applySeasonVisuals();
     if (Math.abs(seasonSnowY - _lastSnowRecolor) > LAND_MAX * 0.015) { _lastSnowRecolor = seasonSnowY; recolorAll(); }  // recolorea solo si la nieve se movió
   }
@@ -1991,10 +2090,11 @@ export async function create({ renderer }) {
   function updateFoam(t) {
     foamGroup.visible = params.shoreWaves;
     if (!params.shoreWaves) return;
+    const wind = 0.6 + params.windSpeed * 1.0;             // con más viento, olas más rápidas y marcadas
     for (const f of foamPatches) {
-      const w = 0.5 + 0.5 * Math.sin(t * f.rate + f.ph);   // lavado entra/sale
-      f.m.material.opacity = 0.12 + 0.5 * w;
-      const s = 0.55 + 0.7 * w; f.m.scale.set(s, s, s);
+      const w = 0.5 + 0.5 * Math.sin(t * f.rate * wind + f.ph);   // lavado entra/sale
+      f.m.material.opacity = (0.12 + 0.5 * w) * (0.7 + 0.5 * params.windSpeed);
+      const s = (0.55 + 0.7 * w) * (0.85 + 0.4 * params.windSpeed); f.m.scale.set(s, s, s);
     }
   }
 
@@ -2011,7 +2111,15 @@ export async function create({ renderer }) {
   const fogTex = new THREE.CanvasTexture(fogCanvas);
   const weatherCells = [];
   let weatherInited = false, windX = 1, windZ = 0, windSpeed = 10;
-  function makeCell() { const g = new THREE.Group(); weatherGroup.add(g); const c = { g, type: 'cloud', x: 0, z: 0, r: 1, puffs: [], rain: null, rainTop: 0, fogs: [], typhoon: false, alpha: 0 }; weatherCells.push(c); return c; }
+  // LLUVIA LOCAL: volumen denso anclado a la cámara → al meterse bajo una nube se ve un aguacero de verdad
+  const LR_N = 2600, LR_H = 55, LR_V = 50;
+  const localRainGeo = new THREE.BufferGeometry();
+  const lrPos = new Float32Array(LR_N * 3);
+  for (let i = 0; i < LR_N; i++) { lrPos[i * 3] = (Math.random() - 0.5) * 2 * LR_H; lrPos[i * 3 + 1] = Math.random() * LR_V; lrPos[i * 3 + 2] = (Math.random() - 0.5) * 2 * LR_H; }
+  localRainGeo.setAttribute('position', new THREE.BufferAttribute(lrPos, 3));
+  const localRainMat = new THREE.PointsMaterial({ color: 0xc2d0e4, size: 2.4, sizeAttenuation: false, transparent: true, opacity: 0, depthWrite: false });
+  const localRain = new THREE.Points(localRainGeo, localRainMat); localRain.frustumCulled = false; scene.add(localRain);
+  function makeCell() { const g = new THREE.Group(); weatherGroup.add(g); const c = { g, type: 'cloud', x: 0, z: 0, r: 1, puffs: [], rain: null, rainTop: 0, fogs: [], typhoon: false, alpha: 0, forced: false }; weatherCells.push(c); return c; }
   function dressCell(cell) {                              // (re)construye los visuales según tipo/tamaño
     for (const p of cell.puffs) cell.g.remove(p); cell.puffs.length = 0;
     for (const f of cell.fogs) { cell.g.remove(f); f.material.dispose(); } cell.fogs.length = 0;
@@ -2021,7 +2129,7 @@ export async function create({ renderer }) {
     cell.rainTop = cloudY;
     if (cell.type !== 'fog') {                            // nubes (claras o de tormenta)
       const mat = wet ? cloudMatDark : cloudMatLight;
-      const nP = cell.typhoon ? 18 : (5 + (Math.random() * 5 | 0));
+      const nP = cell.typhoon ? 26 : (7 + Math.round(r / SIZE * 34));   // más puffs cuanto mayor la celda → cubre la isla
       for (let i = 0; i < nP; i++) {
         const m = new THREE.Mesh(cloudGeo, mat);
         if (cell.typhoon) { const a = i / nP * TWO_PI * 2.2, rr = r * (0.12 + 0.85 * i / nP); m.position.set(Math.cos(a) * rr, cloudY + (Math.random() - 0.5) * r * 0.1, Math.sin(a) * rr); }
@@ -2030,8 +2138,10 @@ export async function create({ renderer }) {
         cell.g.add(m); cell.puffs.push(m);
       }
     }
-    if (wet) {                                            // lluvia: Points dentro del cilindro de la celda
-      const n = cell.typhoon ? 1400 : 700, pos = new Float32Array(n * 3);
+    if (wet) {                                            // lluvia: Points dentro del cilindro de la celda (densidad ∝ área)
+      const area = (r * r) / (SIZE * SIZE);
+      const n = Math.max(500, Math.min(cell.typhoon ? 13000 : 5000, Math.round(area * (cell.typhoon ? 2.4 : 1.7) * 9000)));
+      const pos = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) { const a = Math.random() * TWO_PI, rr = Math.sqrt(Math.random()) * r; pos[i * 3] = Math.cos(a) * rr; pos[i * 3 + 1] = Math.random() * cloudY; pos[i * 3 + 2] = Math.sin(a) * rr; }
       const gge = new THREE.BufferGeometry(); gge.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       const rmat = new THREE.PointsMaterial({ color: cell.typhoon ? 0x8fa0b8 : 0xaebfd6, size: cell.typhoon ? 3 : 2.2, sizeAttenuation: false, transparent: true, opacity: 0.5, depthWrite: false });
@@ -2048,30 +2158,58 @@ export async function create({ renderer }) {
     }
   }
   function recycleCell(cell, firstTime) {
+    cell.forced = false;
     const a = params.weatherAmount, roll = Math.random();
     cell.typhoon = !firstTime && Math.random() < 0.05 * a;            // tifón ocasional
     cell.type = cell.typhoon ? 'rain' : (roll < 0.45 ? 'cloud' : roll < 0.45 + 0.35 * a ? 'rain' : 'fog');
-    cell.r = cell.typhoon ? SIZE * 0.42 : SIZE * (0.14 + Math.random() * 0.16);
+    // celdas grandes: en una isla de pocos km una tormenta real cubre buena parte del terreno
+    cell.r = cell.typhoon ? SIZE * 0.9 : SIZE * (0.22 + Math.random() * 0.24);
     const edge = SIZE * 1.0;
     cell.x = -windX * edge + (Math.random() - 0.5) * SIZE; cell.z = -windZ * edge + (Math.random() - 0.5) * SIZE;
     cell.alpha = 0;
     dressCell(cell);
   }
+  function clearSky() {                                    // barre la tormenta/nubes actuales (el clima sigue según Nubosidad)
+    if (!weatherInited) return;
+    for (const c of weatherCells) { recycleCell(c, true); c.alpha = 0; c.g.position.set(c.x, 0, c.z); }
+    localRain.visible = false;
+    toast('☀️ Cielo despejado');
+  }
+  function forceStorm() {                                  // dispara una tormenta grande sobre la isla (para grabar/probar)
+    params.weather = true;
+    if (!weatherInited) initWeather();
+    const c = weatherCells[0];
+    c.typhoon = false; c.type = 'rain'; c.r = SIZE * 0.75;
+    c.x = (Math.random() - 0.5) * SIZE * 0.2; c.z = (Math.random() - 0.5) * SIZE * 0.2;   // centrada sobre la isla
+    c.alpha = 1; c.forced = true; c.g.position.set(c.x, 0, c.z); dressCell(c);   // forzada: visible aunque Nubosidad sea baja
+    toast('⛈️ Tormenta sobre la isla');
+  }
   function initWeather() {
     weatherInited = true;
     const ang = Math.random() * TWO_PI; windX = Math.cos(ang); windZ = Math.sin(ang); windSpeed = SIZE * (0.01 + Math.random() * 0.02);
-    for (let i = 0; i < 8; i++) { const c = makeCell(); recycleCell(c, true); c.x = (Math.random() - 0.5) * SIZE * 1.6; c.z = (Math.random() - 0.5) * SIZE * 1.6; c.alpha = 1; c.g.position.set(c.x, 0, c.z); }
+    for (let i = 0; i < 14; i++) { const c = makeCell(); recycleCell(c, true); c.x = (Math.random() - 0.5) * SIZE * 1.8; c.z = (Math.random() - 0.5) * SIZE * 1.8; c.alpha = 1; c.g.position.set(c.x, 0, c.z); }
   }
   function updateWeather(dt, t) {
+    // viento (siempre, aunque el clima visible esté apagado): mece árboles cercanos y olas
+    windUniforms.uWindTime.value += dt * (0.5 + params.windSpeed * 2.5);
+    windUniforms.uWindStr.value = params.windSpeed * 0.05;
+    windUniforms.uWindDir.value.set(windX, windZ);
+    windUniforms.uWindCam.value.copy(camera.position);
+    windUniforms.uWindNear.value = SIZE * 0.05; windUniforms.uWindFar.value = SIZE * 0.16;
     weatherGroup.visible = params.weather;
+    localRain.visible = localRain.visible && params.weather;
     if (!params.weather) return;
     if (!weatherInited) initWeather();
-    const want = Math.round(2 + params.weatherAmount * 6);
+    const want = params.weatherAmount <= 0.001 ? 0 : Math.min(weatherCells.length, Math.round(1 + params.weatherAmount * 12));   // 0 = cielo despejado · 1 = cubierto
+    const drift = params.windSpeed * SIZE * 0.018;                  // viento más suave → la lluvia tarda más en pasar
+    let storm = 0;                                                   // cuánto cubre una tormenta el centro de la isla
+    let rainAtCam = 0;                                              // cuánto llueve justo sobre la cámara
+    const cpx = camera.position.x, cpz = camera.position.z;
     for (let i = 0; i < weatherCells.length; i++) {
-      const cell = weatherCells[i], active = i < want;
+      const cell = weatherCells[i], active = i < want || cell.forced;
       cell.g.visible = active;
       if (!active) continue;
-      cell.x += windX * windSpeed * dt; cell.z += windZ * windSpeed * dt;
+      cell.x += windX * drift * dt; cell.z += windZ * drift * dt;
       cell.alpha = Math.min(1, cell.alpha + dt * 0.3);
       cell.g.position.set(cell.x, 0, cell.z);
       if (cell.typhoon) cell.g.rotation.y += dt * 0.25;             // remolino del tifón
@@ -2080,9 +2218,31 @@ export async function create({ renderer }) {
         for (let k = 1; k < arr.length; k += 3) { arr[k] -= fall; if (arr[k] < 0) arr[k] = cell.rainTop; }
         cell.rain.geometry.attributes.position.needsUpdate = true;
         cell.rain.material.opacity = 0.5 * cell.alpha;
+        const cover = Math.max(0, 1 - Math.hypot(cell.x, cell.z) / (cell.r * 1.1));   // cubre el centro de la isla
+        storm = Math.max(storm, cover * cell.alpha * (cell.typhoon ? 1 : 0.85));
+        const cAt = Math.max(0, 1 - Math.hypot(cell.x - cpx, cell.z - cpz) / cell.r);   // ¿la cámara está bajo esta celda?
+        rainAtCam = Math.max(rainAtCam, cAt * cell.alpha * (cell.typhoon ? 1.4 : 1));
       }
       for (const f of cell.fogs) f.material.opacity = 0.5 * cell.alpha * (0.7 + 0.3 * Math.sin(t * 0.5 + f.position.x));
-      if (Math.hypot(cell.x, cell.z) > SIZE * 1.35 && (cell.x * windX + cell.z * windZ) > 0) recycleCell(cell, false);  // cruzó → recicla
+      if (Math.hypot(cell.x, cell.z) > SIZE * 1.45 && (cell.x * windX + cell.z * windZ) > 0) recycleCell(cell, false);  // cruzó → recicla
+    }
+    // oscurece el cielo/luces mientras una tormenta cubre la isla (updateSky ya corrió → multiplicamos)
+    if (storm > 0.01) {
+      sunLight.intensity *= 1 - 0.75 * storm;
+      hemiLight.intensity *= 1 - 0.45 * storm;
+      renderer.toneMappingExposure *= 1 - 0.30 * storm;
+    }
+    // aguacero local alrededor de la cámara (solo si está cerca del suelo y bajo una celda lluviosa)
+    const groundY = Math.max(0, heightAt(cpx, cpz));
+    const lowEnough = THREE.MathUtils.clamp(1 - (camera.position.y - groundY) / (LR_V * 1.4), 0, 1);
+    const lrI = rainAtCam * lowEnough;
+    localRain.visible = lrI > 0.02;
+    if (localRain.visible) {
+      localRain.position.set(cpx, groundY, cpz);
+      const arr = localRainGeo.attributes.position.array, fall = 130 * dt;
+      for (let k = 1; k < arr.length; k += 3) { arr[k] -= fall; if (arr[k] < 0) arr[k] += LR_V; }
+      localRainGeo.attributes.position.needsUpdate = true;
+      localRainMat.opacity = Math.min(0.7, 0.7 * lrI);
     }
   }
 
@@ -2099,21 +2259,31 @@ export async function create({ renderer }) {
     toastEl.textContent = msg; toastEl.style.opacity = '1';
     clearTimeout(toastTimer); toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 1700);
   }
-  function saveIsland() {
-    if (currentSeed == null) { toast('Genera una isla primero'); return; }
-    const data = {
-      seed: currentSeed, sizeKm: params.sizeKm, coverage: params.coverage, erosion: params.erosion,
-      rivers: params.rivers, lakes: params.lakes, vegDensity: params.vegDensity,
-    };
-    try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); toast('Isla guardada ✓'); }
-    catch (e) { toast('No se pudo guardar'); }
-  }
-  // datos mínimos para reconstruir EXACTAMENTE la isla actual (semilla + ajustes de generación)
+  // ---- (de)serialización de arrays grandes (altura cuantizada a Int16, biomas Uint8) en base64 ----
+  function b64FromU8(u8) { let s = ''; const C = 0x8000; for (let i = 0; i < u8.length; i += C) s += String.fromCharCode.apply(null, u8.subarray(i, i + C)); return btoa(s); }
+  function u8FromB64(b64) { const s = atob(b64), u8 = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i); return u8; }
+  function packHeights(arr) { const n = arr.length, i16 = new Int16Array(n); for (let i = 0; i < n; i++) { let v = Math.round(arr[i] * 50); i16[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v; } return b64FromU8(new Uint8Array(i16.buffer)); }
+  function unpackHeights(b64) { const u8 = u8FromB64(b64), i16 = new Int16Array(u8.buffer, 0, u8.length >> 1), f = new Float32Array(i16.length); for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 50; return f; }
+  // semilla + ajustes (mínimo). La isla generada se reconstruye igual con esto.
   function currentIslandData() {
     return { seed: currentSeed, sizeKm: params.sizeKm, coverage: params.coverage, erosion: params.erosion,
       rivers: params.rivers, lakes: params.lakes, vegDensity: params.vegDensity };
   }
-  // reconstruye una isla a partir de sus datos guardados
+  // isla COMPLETA: además del seed/ajustes, guarda el relieve esculpido, los biomas pintados y lo colocado
+  function islandFullData() {
+    const d = currentIslandData();
+    d.full = true;
+    d.h = packHeights(height);
+    d.b = b64FromU8(biomes);
+    d.placed = placedRecords.map((r) => ({ key: r.key, x: +r.x.toFixed(2), y: +r.y.toFixed(2), z: +r.z.toFixed(2), rot: +r.rot.toFixed(3) }));
+    return d;
+  }
+  function saveIsland() {
+    if (currentSeed == null) { toast('Genera una isla primero'); return; }
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(islandFullData())); toast('Isla guardada ✓'); }
+    catch (e) { toast('No se pudo guardar (¿espacio?)'); }
+  }
+  // reconstruye una isla a partir de sus datos guardados (incluye ediciones y assets si es "completa")
   function applyIslandData(data, quiet) {
     if (!data || typeof data.seed !== 'number') { if (!quiet) toast('Datos inválidos'); return false; }
     params.sizeKm = data.sizeKm ?? params.sizeKm;
@@ -2124,7 +2294,17 @@ export async function create({ renderer }) {
     params.vegDensity = data.vegDensity ?? params.vegDensity;
     configureForSize();
     clearPlaced();
-    buildTerrainMesh(data.seed >>> 0);
+    buildTerrainMesh(data.seed >>> 0);                    // base por semilla
+    if (data.full && data.h && data.b) {                  // aplica esculpido + biomas pintados
+      const hh = unpackHeights(data.h), bb = u8FromB64(data.b);
+      if (hh.length === height.length) height.set(hh);
+      if (bb.length === biomes.length) biomes.set(bb);
+      resetInstances(); propGrid.clear();
+      scatterVegetationAll();                             // re-siembra según los biomas guardados
+      refresh();                                          // re-malla + recolor + relieve
+      spawnFauna(); buildShoreFoam();
+    }
+    if (Array.isArray(data.placed)) for (const r of data.placed) if (assetDefs[r.key]) placeAsset(r.key, r.x, r.y, r.z, r.rot);  // repone assets/animales
     applySizeToView();
     if (gui) gui.controllersRecursive().forEach((c) => c.updateDisplay());
     return true;
@@ -2146,8 +2326,8 @@ export async function create({ renderer }) {
     const lib = readLib();
     const name = (prompt('Nombre del mapa:', 'Isla ' + (lib.length + 1)) || '').trim();
     if (!name) return;
-    lib.push(Object.assign({ name, ts: Date.now() }, currentIslandData()));
-    if (writeLib(lib)) { toast('Guardado en biblioteca ✓'); refreshLibPanel(); } else toast('No se pudo guardar');
+    lib.push(Object.assign({ name, ts: Date.now() }, islandFullData()));   // guarda la isla COMPLETA con sus ediciones
+    if (writeLib(lib)) { toast('Guardado en biblioteca ✓'); refreshLibPanel(); } else toast('No se pudo guardar (¿espacio?)');
   }
   function refreshLibPanel() {
     if (!libEl) return;
@@ -2164,30 +2344,33 @@ export async function create({ renderer }) {
   function openLibrary() { refreshLibPanel(); libEl.style.display = 'block'; }
 
   // ---- GUI ----
-  const gui = new GUI({ title: 'Mundo 3 · Constructor' });
-  gui.add(params, 'sizeKm', { '0.2 km': 0.2, '0.5 km': 0.5, '1 km': 1, '2 km': 2, '5 km': 5 })
-    .name('Tamaño del mapa').onChange(setSize);
-  gui.add(params, 'coverage', 5, 70, 1).name('% tierra (cobertura)');
-  gui.add(params, 'erosion', 0, 1, 0.05).name('Erosión (al generar)');
-  gui.add(params, 'rivers', 0, 8, 1).name('Ríos (al generar)');
-  gui.add(params, 'lakes', 0, 6, 1).name('Lagos (al generar)');
-  gui.add(params, 'mode', ['Subir', 'Bajar', 'Suavizar', 'Aplanar']).name('Herramienta (esculpir)');
-  brushCtrl = gui.add(params, 'brushSize', 3, 200, 1).name('Tamaño pincel (m)').onChange(resizeRing);
-  gui.add(params, 'strength', 0.1, 3, 0.1).name('Fuerza');
-  gui.add(params, 'vegDensity', 0.2, 4, 0.1).name('Densidad vegetación');
-  gui.add(params, 'vegDist', 200, 3000, 50).name('Distancia veg. (m)').onChange(() => { instDirty = true; });
-  gui.add({ gen: generateRandom }, 'gen').name('🎲 Generar isla aleatoria');
+  const gui = new GUI({ title: CINE_MODE ? 'Evermark · Cinemática' : 'Mundo 3 · Constructor' });
+  // mapas (útil en ambos modos): guardar/cargar
   gui.add({ save: saveIsland }, 'save').name('💾 Guardar isla (rápido)');
   gui.add({ load: () => loadIsland(false) }, 'load').name('📂 Cargar isla (rápido)');
   gui.add({ saveAs: saveNamedIsland }, 'saveAs').name('💾 Guardar como…');
   gui.add({ lib: openLibrary }, 'lib').name('📚 Mis mapas');
-  gui.add({ sow: scatterAssets }, 'sow').name('🌱 Sembrar assets');
-  gui.add({ clr: clearPlaced }, 'clr').name('🧹 Limpiar assets');
-  gui.add({ plano: flat }, 'plano').name('Vaciar a mar');
-  gui.add(params, 'mar').name('Mostrar mar').onChange((v) => { water.visible = v; });
-  gui.add(params, 'wireframe').name('Malla').onChange((v) => { mesh.material.wireframe = v; });
-  gui.add(params, 'heatmap').name('🗺️ Relieve (heatmap)').onChange((v) => { recolorAll(); legendEl.style.display = v ? 'block' : 'none'; });
-  gui.add({ cine: toggleCinematic }, 'cine').name('🎬 Cinemática (grabar)');
+  // construcción: oculta en la sección Cinemática
+  const fB = gui.addFolder('Construcción');
+  fB.add(params, 'sizeKm', { '0.2 km': 0.2, '0.5 km': 0.5, '1 km': 1, '2 km': 2, '5 km': 5 }).name('Tamaño del mapa').onChange(setSize);
+  fB.add(params, 'coverage', 5, 70, 1).name('% tierra (cobertura)');
+  fB.add(params, 'erosion', 0, 1, 0.05).name('Erosión (al generar)');
+  fB.add(params, 'rivers', 0, 8, 1).name('Ríos (al generar)');
+  fB.add(params, 'lakes', 0, 6, 1).name('Lagos (al generar)');
+  fB.add(params, 'mode', ['Subir', 'Bajar', 'Suavizar', 'Aplanar']).name('Herramienta (esculpir)');
+  brushCtrl = fB.add(params, 'brushSize', 3, 200, 1).name('Tamaño pincel (m)').onChange(resizeRing);
+  fB.add(params, 'strength', 0.1, 3, 0.1).name('Fuerza');
+  fB.add(params, 'vegDensity', 0.2, 4, 0.1).name('Densidad vegetación');
+  fB.add(params, 'vegDist', 200, 3000, 50).name('Distancia veg. (m)').onChange(() => { instDirty = true; });
+  fB.add({ gen: generateRandom }, 'gen').name('🎲 Generar isla aleatoria');
+  fB.add({ sow: scatterAssets }, 'sow').name('🌱 Sembrar assets');
+  fB.add({ clr: clearPlaced }, 'clr').name('🧹 Limpiar assets');
+  fB.add({ plano: flat }, 'plano').name('Vaciar a mar');
+  fB.add(params, 'mar').name('Mostrar mar').onChange((v) => { water.visible = v; });
+  fB.add(params, 'wireframe').name('Malla').onChange((v) => { mesh.material.wireframe = v; });
+  fB.add(params, 'heatmap').name('🗺️ Relieve (heatmap)').onChange((v) => { recolorAll(); legendEl.style.display = v ? 'block' : 'none'; });
+  if (CINE_MODE || MANAGE_MODE) fB.hide();
+  gui.add({ mg: () => humanSys && humanSys.togglePanel() }, 'mg').name('🏝️ Gestión (followers)');
   const fDN = gui.addFolder('Día / Noche');
   const timeCtrl = fDN.add(params, 'timeOfDay', 0, 24, 0.01).name('Hora').onChange(updateSky);
   fDN.add(params, 'daySeconds', 10, 600, 5).name('Duración del día (s)');
@@ -2201,8 +2384,25 @@ export async function create({ renderer }) {
   fCL.add(params, 'seasonSeconds', 30, 1200, 10).name('Duración del año (s)');
   fCL.add(params, 'weather').name('Clima localizado');
   fCL.add(params, 'weatherAmount', 0, 1, 0.05).name('Nubosidad');
+  fCL.add(params, 'windSpeed', 0, 1, 0.05).name('Viento (mece árboles/olas)');
   fCL.add(params, 'shoreWaves').name('Olas de orilla');
+  fCL.add({ storm: forceStorm }, 'storm').name('⛈️ Tormenta ahora');
+  fCL.add({ clear: clearSky }, 'clear').name('☀️ Despejar cielo');
   fCL.open();
+  // escenas de cámara scripted: capturás planos (cámara + hora + estación) y se reproducen interpolados
+  const fCM = gui.addFolder('🎬 Cinemática');
+  fCM.add({ fly: toggleCinematic }, 'fly').name('Vuelo automático (Full HD)');
+  fCM.add({ cap: captureSceneKey }, 'cap').name('➕ Capturar plano');
+  fCM.add(params, 'sceneSegSecs', 1, 12, 0.5).name('Segundos por plano');
+  fCM.add(params, 'cineFormat', ['1080p 16:9', '1440p 16:9', '720p 16:9', 'Vertical 9:16', 'Cuadrado 1:1', 'Cine 21:9', 'Clásico 4:3', 'Personalizado']).name('Formato grabación');
+  fCM.add(params, 'filter', Object.keys(GRADE_PRESETS)).name('Filtro (look)').onChange(applyFilter);
+  fCM.add({ play: () => playScene(false) }, 'play').name('▶ Reproducir escena');
+  fCM.add({ rec: () => playScene(true) }, 'rec').name('● Reproducir y grabar (webm)');
+  fCM.add({ mp4: renderSceneMP4 }, 'mp4').name('🎬 Renderizar MP4 (offline, sin lag)');
+  fCM.add({ free: recToggle }, 'free').name('● Grabar libre (on/off)');
+  fCM.add({ stop: stopScene }, 'stop').name('⏹ Detener');
+  fCM.add({ clr: clearScene }, 'clr').name('🗑 Limpiar escena');
+  if (CINE_MODE) fCM.hide();   // en la sección Cinemática usamos el panel izquierdo dedicado
 
   // reloj + nombre de la fase lunar en pantalla
   const clockEl = document.createElement('div');
@@ -2245,8 +2445,19 @@ export async function create({ renderer }) {
     'border-radius:20px;padding:7px 18px;backdrop-filter:blur(4px);transition:opacity .8s;pointer-events:none;';
   cineHint.textContent = '🎬 Cinemática · Esc para salir · C para alternar';
   document.body.appendChild(cineHint);
-  function fitLetterbox() {                            // encaja el canvas 16:9 centrado con barras negras
-    const cv = renderer.domElement, aspect = 16 / 9;
+  // formatos de cámara/grabación (ancho × alto del buffer interno)
+  const CINE_FORMATS = {
+    '1080p 16:9': [1920, 1080], '1440p 16:9': [2560, 1440], '720p 16:9': [1280, 720],
+    'Vertical 9:16': [1080, 1920], 'Cuadrado 1:1': [1080, 1080], 'Cine 21:9': [2560, 1080],
+    'Clásico 4:3': [1440, 1080], 'Personalizado': null,
+  };
+  function cineSize() {
+    const p = CINE_FORMATS[params.cineFormat];
+    if (p) return p;
+    return [Math.max(64, params.cineW | 0), Math.max(64, params.cineH | 0)];   // personalizado
+  }
+  function fitLetterbox(aspect) {                       // encaja el canvas (aspect dado) centrado con barras negras
+    const cv = renderer.domElement;
     let w = innerWidth, ht = innerWidth / aspect;
     if (ht > innerHeight) { ht = innerHeight; w = innerHeight * aspect; }
     cv.style.position = 'fixed';
@@ -2263,25 +2474,31 @@ export async function create({ renderer }) {
     _cineSaved.cv = renderer.domElement.style.cssText;
     _cineSaved.bg = document.body.style.background;
     _cineSaved.dpr = renderer.getPixelRatio();
+    _cineSaved.vegDist = params.vegDist;
+    params.vegDist = SIZE * 4; instDirty = true;        // no ocultar vegetación por lejanía durante la grabación
     controls.enabled = false;
     if (paletteEl) paletteEl.style.display = 'none';
+    if (cinePanel) cinePanel.style.display = 'none';
     gui.hide(); clockEl.style.display = 'none'; legendEl.style.display = 'none';
     if (libEl) libEl.style.display = 'none';
     ring.visible = false;
     const back = document.getElementById('back'); if (back) back.style.display = 'none';
     const hintEl = document.getElementById('hint'); if (hintEl) hintEl.style.display = 'none';
     document.body.style.background = '#000';
-    renderer.setPixelRatio(1);                         // buffer interno exacto 1920x1080
-    renderer.setSize(1920, 1080, false);
-    camera.aspect = 16 / 9; camera.updateProjectionMatrix();
-    fitLetterbox();
+    const [cw, ch] = cineSize();
+    renderer.setPixelRatio(1);                         // buffer interno exacto al formato elegido
+    renderer.setSize(cw, ch, false);
+    composer.setPixelRatio(1); composer.setSize(cw, ch);
+    camera.aspect = cw / ch; camera.updateProjectionMatrix();
+    fitLetterbox(cw / ch);
     cineHint.style.display = 'block'; cineHint.style.opacity = '1';
   }
   function exitCinematic() {
     if (!cinematic) return;
     cinematic = false;
     controls.enabled = true;
-    if (paletteEl) paletteEl.style.display = '';
+    if (paletteEl && !CINE_MODE) paletteEl.style.display = '';
+    if (cinePanel && CINE_MODE) cinePanel.style.display = '';
     gui.show(); clockEl.style.display = '';
     legendEl.style.display = params.heatmap ? 'block' : 'none';
     const back = document.getElementById('back'); if (back) back.style.display = 'block';
@@ -2289,14 +2506,44 @@ export async function create({ renderer }) {
     renderer.domElement.style.cssText = _cineSaved.cv || '';
     renderer.setPixelRatio(_cineSaved.dpr || 1);
     renderer.setSize(innerWidth, innerHeight, true);
+    composer.setPixelRatio(_cineSaved.dpr || 1); composer.setSize(innerWidth, innerHeight);
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
     camera.position.copy(_cineSaved.cam);
     controls.target.copy(_cineSaved.target);
     controls.update();
+    if (_cineSaved.vegDist != null) { params.vegDist = _cineSaved.vegDist; instDirty = true; }
     cineHint.style.display = 'none';
   }
   function toggleCinematic() { cinematic ? exitCinematic() : enterCinematic(); }
-  function cineUpdate(dt) {                            // autopiloto: órbita lenta con dolly y subidas/bajadas
+  // ---- grabación de video: captura el canvas a WebM y lo descarga (MediaRecorder) ----
+  let mediaRec = null, recChunks = [];
+  function startRecording() {
+    if (mediaRec) return;
+    if (typeof MediaRecorder === 'undefined' || !renderer.domElement.captureStream) { toast('Tu navegador no soporta grabar'); return; }
+    try {
+      const stream = renderer.domElement.captureStream(60);
+      const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
+      mediaRec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 16000000 });
+      recChunks = [];
+      mediaRec.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+      mediaRec.onstop = () => {
+        const blob = new Blob(recChunks, { type: 'video/webm' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = 'evermark-' + Date.now() + '.webm'; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        mediaRec = null;
+      };
+      mediaRec.start();
+      toast('● Grabando…');
+    } catch (e) { toast('No se pudo grabar'); mediaRec = null; }
+  }
+  function stopRecording() { if (mediaRec && mediaRec.state !== 'inactive') { mediaRec.stop(); toast('🎞️ Video descargado ✓'); } }
+  function recToggle() {                                // grabación libre (sin escena): graba lo que se ve
+    if (mediaRec) { stopRecording(); exitCinematic(); }
+    else { enterCinematic(); startRecording(); }
+  }
+  function cineUpdate(dt) {                            // autopiloto: órbita amplia que mantiene TODA la isla en cuadro
     cineT += dt; const t = cineT, SZ = SIZE || 1000;
     const peak = Math.max(LAND_MAX, SZ * 0.12);
     const az = t * 0.10;
@@ -2312,10 +2559,59 @@ export async function create({ renderer }) {
     if (cineHintT > 0) { cineHintT -= dt; if (cineHintT <= 0) cineHint.style.opacity = '0'; }
   }
   const onCineKey = (e) => {
-    if (e.code === 'Escape' && cinematic) { exitCinematic(); e.stopImmediatePropagation(); }
+    if (e.code === 'Escape' && (cinematic || scenePlaying)) { stopScene(); exitCinematic(); e.stopImmediatePropagation(); }
     else if (e.code === 'KeyC' && !/input|textarea/i.test((e.target && e.target.tagName) || '')) toggleCinematic();
   };
   addEventListener('keydown', onCineKey, true);        // captura → corre antes del Esc del shell
+
+  // ===== ESCENAS SCRIPTED: capturás keyframes (cámara + hora + estación + clima) y se reproducen interpolados =====
+  let scenePlaying = false, sceneT = 0, sceneCurve = null, sceneRecord = false;
+  const sceneKeys = [];
+  function snapState() {   // estado actual completo para un keyframe
+    return {
+      pos: camera.position.clone(), tgt: controls.target.clone(),
+      tod: params.timeOfDay, season: params.season, moon: params.moonPhase,
+      weather: params.weatherAmount, wind: params.windSpeed,
+    };
+  }
+  function applyState(k) { // coloca cámara + clima como el keyframe (para previsualizar/editar)
+    camera.position.copy(k.pos); controls.target.copy(k.tgt); controls.update();
+    params.timeOfDay = k.tod; params.season = k.season; params.moonPhase = k.moon;
+    params.weatherAmount = k.weather; params.windSpeed = k.wind;
+    applySeasonVisuals(); updateSky();
+    if (gui) gui.controllersRecursive().forEach((c) => c.updateDisplay());
+  }
+  function captureSceneKey() { sceneKeys.push(snapState()); refreshCinePanel(); toast('🎬 Keyframe ' + sceneKeys.length); }
+  function gotoSceneKey(i) { if (sceneKeys[i]) applyState(sceneKeys[i]); }
+  function delSceneKey(i) { sceneKeys.splice(i, 1); refreshCinePanel(); }
+  function clearScene() { sceneKeys.length = 0; scenePlaying = false; refreshCinePanel(); toast('Escena vaciada'); }
+  function stopScene() {
+    if (!scenePlaying) return;
+    scenePlaying = false;
+    if (sceneRecord) { sceneRecord = false; stopRecording(); exitCinematic(); } else controls.enabled = true;
+  }
+  function playScene(record) {
+    if (sceneKeys.length < 2) { toast('Capturá al menos 2 keyframes (➕)'); return; }
+    sceneCurve = new THREE.CatmullRomCurve3(sceneKeys.map((k) => k.pos.clone()), false, 'catmullrom', 0.5);
+    scenePlaying = true; sceneT = 0; controls.enabled = false;
+    sceneRecord = !!record;
+    if (record) { enterCinematic(); startRecording(); }   // encuadre limpio + grabación a video
+  }
+  function sceneUpdate(dt) {
+    const total = Math.max(0.1, (sceneKeys.length - 1) * params.sceneSegSecs);
+    sceneT += dt;
+    const u = Math.min(1, sceneT / total);
+    camera.position.copy(sceneCurve.getPoint(u));
+    const f = u * (sceneKeys.length - 1), i = Math.min(sceneKeys.length - 2, Math.floor(f)), k = f - i;
+    const a = sceneKeys[i], b = sceneKeys[i + 1];
+    _camLook.copy(a.tgt).lerp(b.tgt, k); camera.lookAt(_camLook);
+    params.timeOfDay = (a.tod + (b.tod - a.tod) * k + 24) % 24;          // hora, estación y clima también se interpolan
+    params.season = a.season + (b.season - a.season) * k;
+    params.moonPhase = a.moon + (b.moon - a.moon) * k;
+    params.weatherAmount = a.weather + (b.weather - a.weather) * k;
+    params.windSpeed = a.wind + (b.wind - a.wind) * k;
+    if (u >= 1) stopScene();
+  }
 
   // init: si hay una isla guardada, se recrea idéntica; si no, una aleatoria nueva
   configureForSize();
@@ -2365,6 +2661,23 @@ export async function create({ renderer }) {
       border: 1px solid transparent; border-radius: 7px; padding: 5px 8px; font-size: 13px; }
     #map-library .lib-actions button:hover { background: rgba(80,120,190,.7); }
     #map-library .hintline { color: #9fb4d4; font-size: 12px; line-height: 1.4; }
+    #cine-panel { position: fixed; top: 64px; left: 16px; z-index: 24; width: 220px;
+      max-height: calc(100vh - 84px); overflow-y: auto;
+      background: rgba(10,16,28,.62); border: 1px solid rgba(160,190,255,.25); border-radius: 12px;
+      padding: 10px; backdrop-filter: blur(6px); font-family: system-ui, sans-serif; color: #e7eefc; }
+    #cine-panel .ap-head span { color: #cfe0ff; font-size: 13px; letter-spacing: .5px; text-transform: uppercase; opacity: .85; font-weight: 600; }
+    #cine-panel button { display: block; width: 100%; text-align: left; margin: 5px 0; cursor: pointer;
+      background: rgba(40,60,95,.5); color: #e7eefc; border: 1px solid transparent; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    #cine-panel button:hover { background: rgba(60,90,150,.6); }
+    #cine-panel .cine-seg { font-size: 12px; color: #b9c8e0; margin: 8px 2px; display: flex; align-items: center; gap: 6px; }
+    #cine-panel .cine-seg input { width: 60px; background: rgba(40,60,95,.5); color: #e7eefc; border: 1px solid rgba(160,190,255,.2); border-radius: 6px; padding: 3px 6px; }
+    #cine-panel .cine-kf { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+      background: rgba(40,60,95,.4); border-radius: 8px; padding: 5px 8px; margin: 3px 0; font-size: 12px; }
+    #cine-panel .cine-kf .ka { flex: 0 0 auto; display: flex; gap: 3px; }
+    #cine-panel .cine-kf .ka button { width: auto; margin: 0; padding: 3px 7px; }
+    #cine-panel .hintline { color: #9fb4d4; font-size: 11px; margin-top: 8px; line-height: 1.35; }
+    #cine-panel .play { background: rgba(50,110,70,.6); }
+    #cine-panel .rec { background: rgba(140,50,55,.6); }
   `;
   document.head.appendChild(style);
   paletteEl = document.createElement('div');
@@ -2387,6 +2700,7 @@ export async function create({ renderer }) {
   h += '<div class="hintline">Elige una herramienta y usa clic-izquierdo sobre el terreno.</div></div>';
   paletteEl.innerHTML = h;
   document.body.appendChild(paletteEl);
+  if (CINE_MODE || MANAGE_MODE) paletteEl.style.display = 'none';   // estas secciones no editan el terreno
   const onPaletteClick = (e) => {
     const head = e.target.closest('.sec-h');          // clic en cabecera de sección → plega/expande
     if (head) {
@@ -2427,34 +2741,144 @@ export async function create({ renderer }) {
     }
   });
 
+  // ---- panel IZQUIERDO de Cinemática: recorrido por keyframes ----
+  const cinePanel = document.createElement('div');
+  cinePanel.id = 'cine-panel';
+  cinePanel.innerHTML =
+    '<div class="ap-head"><span>🎬 Cinemática</span></div>' +
+    '<button data-cine="add">➕ Añadir keyframe</button>' +
+    '<div class="cine-seg">Seg/tramo <input id="cine-seg" type="number" min="1" max="20" step="0.5" value="' + params.sceneSegSecs + '"></div>' +
+    '<div class="cine-seg">Formato <select id="cine-fmt">' +
+      Object.keys(CINE_FORMATS).map((f) => `<option${f === params.cineFormat ? ' selected' : ''}>${f}</option>`).join('') +
+    '</select></div>' +
+    '<div class="cine-seg">Filtro <select id="cine-flt">' +
+      Object.keys(GRADE_PRESETS).map((f) => `<option${f === params.filter ? ' selected' : ''}>${f}</option>`).join('') +
+    '</select></div>' +
+    '<div id="cine-list"></div>' +
+    '<button class="rec" data-cine="mp4">🎬 Renderizar MP4 (sin lag)</button>' +
+    '<button class="play" data-cine="play">▶ Play (previo)</button>' +
+    '<button class="rec" data-cine="rec">● Play + Grabar (webm)</button>' +
+    '<button data-cine="stop">⏹ Stop</button>' +
+    '<button class="rec" data-cine="freerec">● Grabar libre (on/off)</button>' +
+    '<button data-cine="fly">🛰 Vuelo automático</button>' +
+    '<button data-cine="clear">🗑 Limpiar</button>' +
+    '<div class="hintline">Orbitá con clic-DER y ajustá clima/hora; “➕” fija un keyframe. “Renderizar MP4” codifica cuadro a cuadro: fluido aunque la PC vaya lenta.</div>';
+  document.body.appendChild(cinePanel);
+  if (!CINE_MODE) cinePanel.style.display = 'none';
+  const cineListEl = cinePanel.querySelector('#cine-list');
+  function refreshCinePanel() {
+    if (!cineListEl) return;
+    cineListEl.innerHTML = sceneKeys.map((k, i) => {
+      const hh = k.tod | 0, mm = (k.tod - hh) * 60 | 0;
+      const seas = ['🌸', '☀️', '🍂', '❄️'][Math.min(3, Math.floor((((k.season % 1) + 1) % 1) * 4))];
+      return `<div class="cine-kf"><span>KF ${i + 1} · ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')} ${seas}</span>` +
+        `<span class="ka"><button data-go="${i}" title="Ir a este keyframe">⤿</button><button data-del="${i}" title="Borrar">✕</button></span></div>`;
+    }).join('');
+  }
+  cinePanel.addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.go != null) { gotoSceneKey(+b.dataset.go); return; }
+    if (b.dataset.del != null) { delSceneKey(+b.dataset.del); return; }
+    const act = b.dataset.cine;
+    if (act === 'add') captureSceneKey();
+    else if (act === 'play') playScene(false);
+    else if (act === 'rec') playScene(true);
+    else if (act === 'mp4') renderSceneMP4();
+    else if (act === 'stop') stopScene();
+    else if (act === 'freerec') recToggle();
+    else if (act === 'fly') toggleCinematic();
+    else if (act === 'clear') clearScene();
+  });
+  cinePanel.querySelector('#cine-seg').addEventListener('change', (e) => { const v = parseFloat(e.target.value); if (v > 0) params.sceneSegSecs = v; });
+  cinePanel.querySelector('#cine-flt').addEventListener('change', (e) => { params.filter = e.target.value; applyFilter(); });
+  cinePanel.querySelector('#cine-fmt').addEventListener('change', (e) => {
+    params.cineFormat = e.target.value;
+    if (params.cineFormat === 'Personalizado') {
+      const s = (prompt('Resolución (ancho x alto):', params.cineW + 'x' + params.cineH) || '').toLowerCase().split('x');
+      const w = parseInt(s[0], 10), ht = parseInt(s[1], 10);
+      if (w > 0 && ht > 0) { params.cineW = w; params.cineH = ht; }
+    }
+  });
+  refreshCinePanel();
+
+  // un paso de simulación (reutilizable en tiempo real y en el render offline)
+  let offlineRendering = false, humanSys = null;
+  function stepWorld(dt) {
+    if (params.dayCycle && !scenePlaying) { params.timeOfDay = (params.timeOfDay + dt * 24 / params.daySeconds) % 24; if (!offlineRendering) timeCtrl.updateDisplay(); }
+    if (params.moonCycle) { params.moonPhase = (params.moonPhase + dt / (params.daySeconds * 29.5)) % 1; if (!offlineRendering) moonCtrl.updateDisplay(); }
+    if (params.seasonCycle && !scenePlaying && !offlineRendering) seasonCtrl.updateDisplay();
+    updateSky(); updateClockHud();
+    water.material.uniforms.time.value += dt * 0.5;
+    for (const lk of lakeWaters) lk.material.uniforms.time.value += dt * 0.4;
+    riverNormals.offset.y -= dt * 0.25;
+    riverNormals.offset.x = Math.sin(riverNormals.offset.y * 2) * 0.02;
+    if (normalsDirty) { geo.computeVertexNormals(); normalsDirty = false; }
+    updateFauna(dt); updateSeason(dt); updateFoam(faunaTime); updateWeather(dt, faunaTime);
+    if (humanSys) humanSys.update(dt);   // followers: comportamiento día/noche
+    if (scenePlaying) sceneUpdate(dt); else if (cinematic) cineUpdate(dt); else controls.update();
+    cullInstances();
+    const gy = Math.max(0, heightAt(camera.position.x, camera.position.z));
+    if (camera.position.y < gy + 1.5) camera.position.y = gy + 1.5;
+  }
+  // RENDER OFFLINE a MP4: avanza con dt fijo y codifica cuadro a cuadro (fluido sin importar el rendimiento)
+  async function renderSceneMP4() {
+    if (sceneKeys.length < 2) { toast('Capturá al menos 2 keyframes'); return; }
+    if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') { toast('Render MP4 requiere WebCodecs (Chrome/Edge)'); return; }
+    let Muxer, ArrayBufferTarget;
+    try { ({ Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.0.0/+esm')); }
+    catch (e) { toast('No se pudo cargar el codificador MP4'); return; }
+    enterCinematic();
+    let [cw, ch] = cineSize(); cw &= ~1; ch &= ~1;       // H.264 requiere dimensiones pares
+    const fps = 60, dt = 1 / fps;
+    const total = Math.max(0.1, (sceneKeys.length - 1) * params.sceneSegSecs), frames = Math.ceil(total * fps);
+    sceneCurve = new THREE.CatmullRomCurve3(sceneKeys.map((k) => k.pos.clone()), false, 'catmullrom', 0.5);
+    scenePlaying = true; sceneT = 0; sceneRecord = false; controls.enabled = false;
+    offlineRendering = true;
+    const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: 'avc', width: cw, height: ch }, fastStart: 'in-memory' });
+    const encoder = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: (e) => console.error('VideoEncoder', e) });
+    encoder.configure({ codec: 'avc1.640028', width: cw, height: ch, bitrate: 16000000, framerate: fps });
+    try {
+      for (let f = 0; f < frames; f++) {
+        stepWorld(dt);
+        renderFrame();
+        const vf = new VideoFrame(renderer.domElement, { timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps) });
+        encoder.encode(vf, { keyFrame: f % 120 === 0 });
+        vf.close();
+        if (f % 10 === 0) { cineHint.style.display = 'block'; cineHint.style.opacity = '1'; cineHint.textContent = `🎞️ Renderizando ${Math.round(f / frames * 100)}%`; }
+        await new Promise((r) => requestAnimationFrame(r));          // cede al navegador (no se congela)
+        while (encoder.encodeQueueSize > 6) await new Promise((r) => setTimeout(r, 0));   // RAM acotada
+      }
+      await encoder.flush(); muxer.finalize();
+      const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'evermark-' + Date.now() + '.mp4'; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 6000);
+      toast('🎬 MP4 renderizado ✓');
+    } catch (e) { console.error(e); toast('Error renderizando MP4'); }
+    try { encoder.close(); } catch (e) {}
+    offlineRendering = false; scenePlaying = false; exitCinematic();
+  }
+
+  // ---- followers / humanos (simulación con DB) ----
+  try {
+    humanSys = await createHumanSystem({
+      scene, camera, heightAt, findReliefSpots, SIZE, toast,
+      getTime: () => params.timeOfDay, cullDist: SIZE * 0.6,
+    });
+    if (MANAGE_MODE) humanSys.showPanel();
+  } catch (e) { console.error('humanSys', e); }
+
   return {
-    scene, camera, showHud: false,
+    scene, camera, showHud: false, render: renderFrame,
     terrainClassAt, findReliefSpots,   // API de geomorfología (p.ej. fauna que anida en 'acantilado')
-    hint: 'Tamaño del mapa en el panel · clic-izq esculpe/coloca · clic-DER orbita · arrastrar rueda mueve · girar rueda zoom',
-    update(dt) {
-      if (params.dayCycle) { params.timeOfDay = (params.timeOfDay + dt * 24 / params.daySeconds) % 24; timeCtrl.updateDisplay(); }
-      if (params.moonCycle) { params.moonPhase = (params.moonPhase + dt / (params.daySeconds * 29.5)) % 1; moonCtrl.updateDisplay(); }
-      if (params.seasonCycle) seasonCtrl.updateDisplay();
-      updateSky(); updateClockHud();
-      water.material.uniforms.time.value += dt * 0.5;
-      for (const lk of lakeWaters) lk.material.uniforms.time.value += dt * 0.4;
-      riverNormals.offset.y -= dt * 0.25;   // desplaza el normal map río abajo → fluye
-      riverNormals.offset.x = Math.sin(riverNormals.offset.y * 2) * 0.02;
-      if (normalsDirty) { geo.computeVertexNormals(); normalsDirty = false; }  // 1 vez por frame
-      updateFauna(dt);   // aves volando, ballenas cada tanto, peces saltando
-      updateSeason(dt);  // avance de estaciones: nieve dinámica + tinte del follaje
-      updateFoam(faunaTime);          // olas rompiendo en la orilla
-      updateWeather(dt, faunaTime);   // nubes/lluvia/niebla/tifón por zonas
-      if (cinematic) cineUpdate(dt); else controls.update();
-      cullInstances();   // recompone vegetación visible (frustum + distancia + LOD) si la cámara se movió
-      // la cámara no atraviesa el terreno ni baja del agua
-      const gy = Math.max(0, heightAt(camera.position.x, camera.position.z));
-      const minY = gy + 1.5;
-      if (camera.position.y < minY) camera.position.y = minY;
-    },
+    hint: CINE_MODE
+      ? 'Cinemática · clic-DER orbita para encuadrar · ➕ Capturar plano · ▶ Reproducir/grabar escena · Esc detiene'
+      : MANAGE_MODE
+      ? 'Isla · ➕ Agregá followers en el panel izquierdo · cada uno llega y vive su ciclo día/noche · clic-DER orbita'
+      : 'Tamaño del mapa en el panel · clic-izq esculpe/coloca · clic-DER orbita · arrastrar rueda mueve · girar rueda zoom',
+    update(dt) { if (!offlineRendering) stepWorld(dt); },   // durante el render offline lo maneja renderSceneMP4
     onResize(w, ht) {
-      if (cinematic) { renderer.setSize(1920, 1080, false); camera.aspect = 16 / 9; camera.updateProjectionMatrix(); fitLetterbox(); }
-      else { camera.aspect = w / ht; camera.updateProjectionMatrix(); }
+      if (cinematic) { const [cw, ch] = cineSize(); renderer.setSize(cw, ch, false); composer.setSize(cw, ch); camera.aspect = cw / ch; camera.updateProjectionMatrix(); fitLetterbox(cw / ch); }
+      else { camera.aspect = w / ht; camera.updateProjectionMatrix(); composer.setSize(w, ht); }
     },
     dispose() {
       if (cinematic) exitCinematic();   // restaura renderer/canvas antes de salir del mundo
@@ -2469,6 +2893,8 @@ export async function create({ renderer }) {
       clockEl?.remove();
       legendEl?.remove();
       libEl?.remove();
+      cinePanel?.remove();
+      humanSys?.dispose();
       style.remove();
       scene.traverse((o) => {
         if (o.geometry) o.geometry.dispose?.();

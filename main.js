@@ -2,7 +2,9 @@ import * as THREE from 'three';
 
 // --- App shell: menú + cambio entre mundos ---------------------------------
 const WORLDS = {
-  3: { title: 'Constructor', subtitle: 'Constructor de terreno', module: () => import('./src/worlds/builder.js') },
+  3: { title: 'Constructor', subtitle: 'Constructor de terreno', module: () => import('./src/worlds/builder.js'), mode: 'build' },
+  cine: { title: 'Cinemática', subtitle: 'Escenas y video', module: () => import('./src/worlds/builder.js'), mode: 'cinematic' },
+  manage: { title: 'Isla', subtitle: 'Gestión de followers', module: () => import('./src/worlds/builder.js'), mode: 'manage' },
 };
 
 const app = document.getElementById('app');
@@ -30,7 +32,7 @@ async function enterWorld(id) {
     const mod = await WORLDS[id].module();
     // reset de estado del renderer entre mundos
     renderer.shadowMap.enabled = false;
-    current = await mod.create({ renderer, hud });
+    current = await mod.create({ renderer, hud, mode: WORLDS[id].mode });
     menu.classList.add('hidden');
     renderer.domElement.style.display = 'block';
     backBtn.style.display = 'block';
@@ -74,7 +76,8 @@ function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (current) {
     current.update(dt);
-    renderer.render(current.scene, current.camera);
+    if (current.render) current.render();            // mundos con post-proceso (filtros) dibujan ellos mismos
+    else renderer.render(current.scene, current.camera);
   }
 }
 loop();
