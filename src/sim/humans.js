@@ -116,6 +116,7 @@ export async function createHumanSystem(ctx) {
     return 'lonely';
   }
   const MOOD_EMOJI = { happy: '😀', hungry: '🍽️', tired: '😴', lonely: '🙁' };
+  const ACT_LABEL = { build: '🔨 construyendo', work: '💼 trabajando', eat: '🍽️ comiendo', sleep: '😴 durmiendo', social: '💬 socializando', llegando: '⛵ llegando' };
   // ETAPAS de construcción (las habilita el usuario): 0 sin construir · 1 carpas · 2 chozas · 3 cabañas · 4 casas
   let buildEra = 0;
   const ERA_TIER = [0, 0, 1, 2, 3];          // tier de vivienda según la etapa elegida
@@ -336,9 +337,11 @@ export async function createHumanSystem(ctx) {
       if (p >= 1) { hm.building = false; hm.group.remove(hm.scaffold); hm.scaffold.traverse((o) => o.geometry?.dispose?.()); hm.model.scale.y = 1; addBuildingPoint(hm.x, hm.z); }
     }
   }
-  function assignHome(h) {                     // se muda a una con lugar; si no, construye (nivel por followers + recursos)
+  function assignHome(h) {                     // se muda a una con lugar; si no, construye SOLO en zona residencial
     if (h.homeRef) return;
     for (const hm of homesReg) if (hm.occ.size < hm.cap) { hm.occ.add(h.data.id); h.homeRef = hm; return; }
+    const res = zoneSpots ? zoneSpots(1) : [];
+    if (!res.length) return;                                                        // SIN zona residencial → no construyen (recolectan/comen/duermen en el piso)
     let tier = ERA_TIER[buildEra];                                                  // el NIVEL lo elegís vos (Etapa)
     while (tier >= 0 && !allowed.has(HOME_KEY[tier])) tier--;                        // baja al mejor permitido
     if (tier < 0 || !canAfford(HOME_COST[tier])) return;                            // sin permiso o sin material → sigue juntando
@@ -428,9 +431,11 @@ export async function createHumanSystem(ctx) {
   }
 
   function pickHome() {
-    if (!villageCenter) {
-      const spots = findReliefSpots('llano', 4).concat(findReliefSpots('playa', 4));
-      villageCenter = spots[0] ? { x: spots[0].x, z: spots[0].z } : { x: 0, z: 0 };
+    if (!villageCenter) {                       // centro del pueblo en la ISLA PRINCIPAL (tierra más cercana al centro del mapa)
+      const spots = findReliefSpots('llano', 20).concat(findReliefSpots('meseta', 12)).concat(findReliefSpots('playa', 12));
+      let best = null, bd = Infinity;
+      for (const s of spots) { const d = s.x * s.x + s.z * s.z; if (d < bd) { bd = d; best = s; } }
+      villageCenter = best ? { x: best.x, z: best.z } : { x: 0, z: 0 };
     }
     const spread = SIZE * (0.03 + 0.02 * Math.sqrt(humans.length + 1));
     for (let n = 0; n < 24; n++) {
@@ -537,6 +542,45 @@ export async function createHumanSystem(ctx) {
     const gy = Math.max(0, groundAt(h.px, h.pz));   // superficie real (bilineal) → los pies no se hunden
     h.mesh.position.set(h.px, gy + (d > 0.5 ? Math.abs(Math.sin(h.t * 5)) * 0.05 : 0), h.pz);
     return d <= 0.5;
+  }
+  // ===== NAVEGACIÓN A* sobre grilla de caminabilidad (rodea agua y acantilados) =====
+  let navGrid = null, navGN = 64;
+  function buildNav() {
+    navGN = Math.max(48, Math.min(96, Math.round(SIZE / 12)));
+    const GN = navGN; navGrid = new Uint8Array(GN * GN);
+    for (let j = 0; j < GN; j++) for (let i = 0; i < GN; i++) { const x = (i + 0.5) / GN * SIZE - SIZE / 2, z = (j + 0.5) / GN * SIZE - SIZE / 2; navGrid[j * GN + i] = isLand(x, z) ? 1 : 0; }
+  }
+  function nearestWalkable(i, j) { const GN = navGN; if (i >= 0 && j >= 0 && i < GN && j < GN && navGrid[j * GN + i]) return j * GN + i; for (let r = 1; r < GN; r++) for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) { const ni = i + di, nj = j + dj; if (ni < 0 || nj < 0 || ni >= GN || nj >= GN) continue; if (navGrid[nj * GN + ni]) return nj * GN + ni; } return -1; }
+  function pathfind(sx, sz, tx, tz) {
+    if (!navGrid) buildNav();
+    const GN = navGN, w2g = (v) => Math.min(GN - 1, Math.max(0, Math.floor((v + SIZE / 2) / SIZE * GN)));
+    const s = nearestWalkable(w2g(sx), w2g(sz)), goal = nearestWalkable(w2g(tx), w2g(tz));
+    if (s < 0 || goal < 0 || s === goal) return null;
+    const gx = goal % GN, gz = (goal / GN) | 0;
+    const open = [s], came = new Map(), g = new Map([[s, 0]]), f = new Map([[s, 0]]), inOpen = new Set([s]);
+    let iter = 0;
+    while (open.length && iter++ < 9000) {
+      let bi = 0; for (let k = 1; k < open.length; k++) if ((f.get(open[k]) || 1e9) < (f.get(open[bi]) || 1e9)) bi = k;
+      const cur = open.splice(bi, 1)[0]; inOpen.delete(cur);
+      if (cur === goal) { const pts = []; let n = cur; while (n !== undefined) { const ci = n % GN, cj = (n / GN) | 0; pts.push({ x: (ci + 0.5) / GN * SIZE - SIZE / 2, z: (cj + 0.5) / GN * SIZE - SIZE / 2 }); n = came.get(n); } return pts.reverse(); }
+      const ci = cur % GN, cj = (cur / GN) | 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        if (!di && !dj) continue; const ni = ci + di, nj = cj + dj; if (ni < 0 || nj < 0 || ni >= GN || nj >= GN) continue;
+        const nn = nj * GN + ni; if (!navGrid[nn]) continue;
+        if (di && dj && (!navGrid[cj * GN + ni] || !navGrid[nj * GN + ci])) continue;   // sin cortar esquinas
+        const ng = (g.get(cur) || 0) + (di && dj ? 1.414 : 1);
+        if (ng < (g.get(nn) || 1e9)) { came.set(nn, cur); g.set(nn, ng); f.set(nn, ng + Math.hypot(ni - gx, nj - gz)); if (!inOpen.has(nn)) { open.push(nn); inOpen.add(nn); } }
+      }
+    }
+    return null;
+  }
+  // va hacia (tx,tz) siguiendo una RUTA A* (recalcula si cambia el destino); devuelve true al llegar
+  function goTo(h, tx, tz, spd, dt) {
+    if (!h.goal || (h.goal.x - tx) ** 2 + (h.goal.z - tz) ** 2 > 16) { h.goal = { x: tx, z: tz }; h.path = pathfind(h.px, h.pz, tx, tz); h.pathI = 0; }
+    if (!h.path || h.pathI >= h.path.length) return stepLand(h, tx, tz, spd, dt);   // sin ruta → directo (con esquive)
+    const wp = h.path[h.pathI];
+    if (stepLand(h, wp.x, wp.z, spd, dt)) { h.pathI++; if (h.pathI >= h.path.length) { h.path = null; return stepLand(h, tx, tz, spd, dt); } }
+    return false;
   }
   function attachTool(h) {
     if (h.tool) { h.mesh.remove(h.tool); h.tool.traverse((o) => o.geometry?.dispose?.()); h.tool = null; }
@@ -645,10 +689,10 @@ export async function createHumanSystem(ctx) {
     updatePaths(dt);                                    // caminos se van marcando
     for (const h of humans) {
       if (h.arriving) {
-        h.mesh.visible = true; h.t += dt; h.arrT = (h.arrT || 0) + dt;
+        h.act = 'llegando'; h.mesh.visible = true; h.t += dt; h.arrT = (h.arrT || 0) + dt;
         if (h.raft && !h.disembarked) continue;         // la balsa lo lleva (updateRafts lo posiciona)
         if (!h._gather) h._gather = gatherTarget();
-        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 5 || h.arrT > 40) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // desembarcó y llegó al pueblo
+        if (goTo(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 6 || h.arrT > 50) { h.arriving = false; h.stuck = 0; h.goal = null; h.path = null; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // desembarcó y llegó al pueblo
         continue;
       }
       if (buildEra > 0 && !h.homeRef) assignHome(h);     // ¿hay etapa activa? consigue/levanta vivienda
@@ -656,6 +700,7 @@ export async function createHumanSystem(ctx) {
       if (h.builderOf && !h.builderOf.building) h.builderOf = null;   // terminó de construir
       const building = !!h.builderOf;
       const act = building ? 'build' : dayActivity(time);            // rutina del día
+      h.act = act;                                                   // para mostrar qué está haciendo
       if (act === 'work') { const p = PROD[h.data.job]; if (p) for (const k in p) resources[k] += p[k] * dt; }   // produce mientras trabaja
       const dxc = h.px - cx, dzc = h.pz - cz;
       const far = dxc * dxc + dzc * dzc > cull2 && h.data.id !== followId;
@@ -682,8 +727,8 @@ export async function createHumanSystem(ctx) {
         const t = toLand(base.x + Math.cos(a) * r, base.z + Math.sin(a) * r);
         h.tx = t.x; h.tz = t.z;
       }
-      const spd = WALK + (h.data.personality === 'Aventurero' ? 0.4 : 0);   // caminata realista, sin pisar agua
-      if (stepLand(h, h.tx, h.tz, spd, dt)) h.mesh.rotation.y += Math.sin(h.t * 3) * 0.03;   // en el sitio → actividad
+      const spd = WALK + (h.data.personality === 'Aventurero' ? 0.4 : 0);   // caminata realista, ruta A* (rodea agua/acantilados)
+      if (goTo(h, h.tx, h.tz, spd, dt)) h.mesh.rotation.y += Math.sin(h.t * 3) * 0.03;   // en el sitio → actividad
       updateSpeech(h, dt);   // globito de diálogo (tipeo + sonido)
     }
     // seguir a un humano: trasladamos TODO el rig (cámara + objetivo) lo que se movió él → seguimiento suave,
@@ -715,7 +760,10 @@ export async function createHumanSystem(ctx) {
     }
     // guarda recursos y refresca el marcador cada ~4s
     prodSaveT += dt;
-    if (prodSaveT > 4) { prodSaveT = 0; metaSet('resources', resources); updateResLine(); }
+    if (prodSaveT > 2) {
+      prodSaveT = 0; metaSet('resources', resources); updateResLine();
+      if (followId && detailEl && detailEl.style.display !== 'none' && !detailEl.contains(document.activeElement)) { const fh = humans.find((x) => x.data.id === followId); if (fh) renderDetail(fh); }   // refresca "Ahora"/necesidades
+    }
   }
   function setFollow(id) {
     followId = id; const h = humans.find((x) => x.data.id === id);
@@ -739,6 +787,7 @@ export async function createHumanSystem(ctx) {
       `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><b>${MOOD_EMOJI[needKey(h)]} Ficha</b><button id="det-close" style="cursor:pointer;background:rgba(40,60,95,.6);color:#e7eefc;border:none;border-radius:7px;padding:3px 8px;">✕</button></div>` +
       `<input id="det-name" value="${escapeHtml(d.name)}" style="width:100%;margin-bottom:4px;padding:5px 7px;border-radius:7px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;">` +
       `<div style="color:#9fb4d4;font-size:12px;margin-bottom:4px;">#${d.arrival} · ${RANK_NAMES[d.tier ?? 0]} · ${h.workplace ? 'trabaja en ' + h.workplace.id : 'oficio básico'} · ${h.homeRef ? '🏠' : 'sin casa'}</div>` +
+      `<div style="font-size:12px;margin-bottom:4px;">Ahora: <b>${ACT_LABEL[h.act] || '🚶 caminando'}</b></div>` +
       `<label style="font-size:12px;">Oficio <select id="det-job" style="width:100%;margin-bottom:4px;">${sel(ALL_JOBS, d.job)}</select></label>` +
       `<div style="display:flex;gap:6px;"><label style="font-size:12px;flex:1;">Signo<select id="det-sign" style="width:100%;">${sel(SIGNS, d.sign)}</select></label><label style="font-size:12px;flex:1;">Personalidad<select id="det-pers" style="width:100%;">${sel(PERSONALITIES, d.personality)}</select></label></div>` +
       `<div style="font-size:12px;margin-top:6px;">🍽️ hambre${bar(h.hunger)}😴 energía${bar(h.energy)}🙂 social${bar(h.social)}</div>`;

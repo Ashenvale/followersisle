@@ -34,7 +34,7 @@ export async function create({ renderer, mode }) {
     wireframe: false,
     heatmap: false,         // vista de clasificación de relieve (playa/acantilado/barranco/…)
     showZones: true,        // mostrar el coloreado de zonas (residencia/servicios)
-    timeOfDay: 13,          // hora del día (0-24); por defecto MEDIODÍA y congelada
+    timeOfDay: 10,          // hora del día (0-24); por defecto media mañana (trabajando) y congelada
     dayCycle: false,        // por defecto NO avanza (la última selección queda fija)
     daySeconds: 120,        // duración de un día completo (s)
     moonPhase: 0.5,         // 0 luna nueva · 0.5 llena · 1 nueva otra vez
@@ -1913,13 +1913,27 @@ export async function create({ renderer, mode }) {
   // patrulle embebida en la isla). Empuja el radio hacia afuera hasta encontrar mar abierto.
   function waterRingRadius(r0) {
     let r = r0;
-    for (let step = 0; step < 14; step++) {
+    for (let step = 0; step < 22; step++) {
       let land = 0;
-      for (let a = 0; a < 8; a++) { const an = a / 8 * TWO_PI; if (heightAt(Math.cos(an) * r, Math.sin(an) * r) > -1) land++; }
-      if (land <= 2) return r;
-      r += SIZE * 0.06;
+      for (let a = 0; a < 24; a++) { const an = a / 24 * TWO_PI; if (heightAt(Math.cos(an) * r, Math.sin(an) * r) > -1.5) land++; }
+      if (land === 0) return r;            // anillo 100% en agua → no cruza islas
+      r += SIZE * 0.05;
     }
     return r;
+  }
+  function spawnLakeFish(L) {                  // un pez de lago (reutilizado al generar y al reproducirse)
+    const size = 0.15 + Math.random() * 0.13;  // ~0.35-0.6 m
+    const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]);
+    g.scale.setScalar(size); faunaGroup.add(g);
+    fishes.push({ g, lake: L, cx: L.x, cz: L.z, area: L.r * 0.7, surf: L.level, jumpH: 0.4 + size * 2.0, size, state: 'wait', timer: Math.random() * 6, t: 0, dur: 0, jx: L.x, jz: L.z, dx: 1, dz: 0 });
+  }
+  let fishReproT = 0;
+  function reproduceFish(dt) {                 // los peces de lago se reproducen hasta el tope del lago
+    fishReproT += dt; if (fishReproT < 8) return; fishReproT = 0;
+    for (const L of lakeInfo) {
+      let count = 0; for (const f of fishes) if (f.lake === L) count++;
+      if (count < (L.cap || 4) && Math.random() < 0.7) spawnLakeFish(L);
+    }
   }
   function spawnFauna() {
     clearFauna();
@@ -1930,19 +1944,22 @@ export async function create({ renderer, mode }) {
       const fl = { cx: (Math.random() - 0.5) * SIZE * 0.4, cz: (Math.random() - 0.5) * SIZE * 0.4, vx: 0, vz: 0, alt: Math.max(45, LAND_MAX * (0.7 + Math.random() * 0.6)), scatter: 0 };
       flocks.push(fl);
       const nS = 5 + (Math.random() * 6 | 0);
-      for (let k = 0; k < nS; k++) {
-        const b = buildBird(songMat); b.g.scale.setScalar(0.7 + Math.random() * 0.5); faunaGroup.add(b.g);
+      for (let k = 0; k < nS; k++) {           // pájaro chico ~0.25 m (modelo base ~2.4 → escala ~0.1)
+        const b = buildBird(songMat); b.g.scale.setScalar(0.09 + Math.random() * 0.05); faunaGroup.add(b.g);
         birds.push(Object.assign(b, { kind: 'song', flock: fl, R: 6 + Math.random() * 14, ang: Math.random() * 6.283, spd: (0.5 + Math.random() * 0.5) * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 11 + Math.random() * 4 }));
       }
     }
     const nSea = 2 + (Math.random() * 3 | 0);
-    for (let k = 0; k < nSea; k++) {
-      const b = buildBird(seaMat); b.g.scale.setScalar(1.4 + Math.random() * 0.8); faunaGroup.add(b.g);
-      birds.push(Object.assign(b, { kind: 'sea', R: waterRingRadius(SIZE * (0.34 + Math.random() * 0.12)), alt: 22 + Math.random() * 18, cx: 0, cz: 0, ang: Math.random() * 6.283, spd: (0.12 + Math.random() * 0.1) * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 6 + Math.random() * 2, dive: 3 + Math.random() * 5 }));
+    for (let k = 0; k < nSea; k++) {           // ave marina ~1 m de envergadura (escala ~0.4); pesca en lago o mar
+      const b = buildBird(seaMat); b.g.scale.setScalar(0.36 + Math.random() * 0.12); faunaGroup.add(b.g);
+      let cx = 0, cz = 0, R, surf = 0.3, alt;
+      if (lakeInfo.length && Math.random() < 0.5) { const L = lakeInfo[(Math.random() * lakeInfo.length) | 0]; cx = L.x; cz = L.z; R = Math.max(6, L.r * 0.6); surf = L.level; alt = 9 + Math.random() * 7; }
+      else { R = waterRingRadius(SIZE * (0.34 + Math.random() * 0.12)); alt = 20 + Math.random() * 16; }
+      birds.push(Object.assign(b, { kind: 'sea', cx, cz, R, surf, alt, ang: Math.random() * 6.283, spd: (0.12 + Math.random() * 0.1) * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 6 + Math.random() * 2, dive: 3 + Math.random() * 5 }));
     }
     const nR = Math.random() < 0.6 ? 1 : 0;
-    for (let k = 0; k < nR; k++) {
-      const b = buildBird(raptorMat); b.g.scale.setScalar(1.7 + Math.random() * 0.6); faunaGroup.add(b.g);
+    for (let k = 0; k < nR; k++) {              // rapaz ~2 m de envergadura (escala ~0.8)
+      const b = buildBird(raptorMat); b.g.scale.setScalar(0.7 + Math.random() * 0.2); faunaGroup.add(b.g);
       birds.push(Object.assign(b, { kind: 'raptor', R: SIZE * (0.1 + Math.random() * 0.12), alt: Math.max(80, LAND_MAX * 1.5), cx: (Math.random() - 0.5) * SIZE * 0.2, cz: (Math.random() - 0.5) * SIZE * 0.2, ang: Math.random() * 6.283, spd: 0.14 * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 5, hunt: 5 + Math.random() * 5 }));
     }
     // --- BALLENAS: BAJA probabilidad; orbitan en aguas profundas; salen a la superficie CADA TANTO ---
@@ -1985,16 +2002,10 @@ export async function create({ renderer, mode }) {
         }));
       }
     }
-    // --- PECES DE LAGO: varios tamaños, saltan cada tanto ---
+    // --- PECES DE LAGO: varios tamaños, saltan cada tanto, y SE REPRODUCEN ---
     for (const L of lakeInfo) {
-      const n = THREE.MathUtils.clamp(Math.round(L.r / 6), 2, 18);   // más peces en lagos más grandes
-      for (let k = 0; k < n; k++) {
-        const size = 0.15 + Math.random() * 0.13;      // ~0.35-0.6 m (real)
-        const g = buildFish(fishMats[(Math.random() * fishMats.length) | 0]);
-        g.scale.setScalar(size); faunaGroup.add(g);
-        fishes.push({ g, cx: L.x, cz: L.z, area: L.r * 0.7, surf: L.level, jumpH: 0.4 + size * 2.0, size,
-          state: 'wait', timer: Math.random() * 6, t: 0, dur: 0, jx: L.x, jz: L.z, dx: 1, dz: 0 });
-      }
+      L.cap = THREE.MathUtils.clamp(Math.round(L.r / 6), 2, 18);   // tope de peces según el tamaño del lago
+      for (let k = 0; k < L.cap; k++) spawnLakeFish(L);
     }
     // --- PECES DE RÍO: chiquitos, solo en tramos bajos (no montaña) ---
     if (riverPts.length) {
@@ -2040,6 +2051,7 @@ export async function create({ renderer, mode }) {
   }
   function updateFauna(dt) {
     faunaTime += dt; const t = faunaTime;
+    reproduceFish(dt);                          // los peces de lago se reproducen hasta el tope
     for (const fl of flocks) {                  // bandadas: el centro deambula sobre la isla (huye al ser atacada)
       fl.vx += (Math.random() - 0.5) * dt * 4; fl.vz += (Math.random() - 0.5) * dt * 4;
       const sp = Math.hypot(fl.vx, fl.vz), mx = fl.scatter > 0 ? 16 : 5; if (sp > mx) { fl.vx *= mx / sp; fl.vz *= mx / sp; }
@@ -2054,12 +2066,12 @@ export async function create({ renderer, mode }) {
         b.ang += b.spd * dt;
         b.g.position.set(b.flock.cx + Math.cos(b.ang) * b.R, b.flock.alt + Math.sin(t * 1.6 + b.ph) * 3, b.flock.cz + Math.sin(b.ang) * b.R);
         b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
-      } else if (b.kind === 'sea') {            // ave marina: orbita el mar y pica al agua a pescar
+      } else if (b.kind === 'sea') {            // ave marina: orbita el agua (lago o mar) y pica a pescar
         b.ang += b.spd * dt; b.dive -= dt;
-        let y = b.alt + Math.sin(t * 0.8 + b.ph) * 4;
-        if (b.dive > 0 && b.dive < 0.7) y = 2 + Math.abs(b.dive - 0.35) * 50;   // zambullida
+        let y = b.alt + Math.sin(t * 0.8 + b.ph) * 3;
+        if (b.dive > 0 && b.dive < 0.7) y = (b.surf || 0) + 0.6 + Math.abs(b.dive - 0.35) * (b.alt * 2.6);   // zambullida a la superficie
         if (b.dive <= 0) b.dive = 4 + Math.random() * 6;
-        b.g.position.set(Math.cos(b.ang) * b.R, y, Math.sin(b.ang) * b.R);
+        b.g.position.set(b.cx + Math.cos(b.ang) * b.R, y, b.cz + Math.sin(b.ang) * b.R);
         b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
       } else if (b.kind === 'raptor') {         // rapaz: caza bandadas (las dispersa)
         b.ang += b.spd * dt; b.hunt -= dt;
