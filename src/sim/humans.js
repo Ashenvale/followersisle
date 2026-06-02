@@ -413,6 +413,24 @@ export async function createHumanSystem(ctx) {
     if (time >= 6 && time < 8) return 'social';        // despierta, ronda la plaza
     return 'work';
   }
+  // ---- PUNTO DE LLEGADA: dónde aparecen/llegan los nuevos (vienen desde lejos por el mar) ----
+  const BOAT = 8;                              // m/s acercándose por el agua
+  let arrivalPoint = null, arrivalMarker = null;
+  function setArrival(x, z) {
+    arrivalPoint = { x, z }; metaSet('arrival', arrivalPoint);
+    if (!arrivalMarker) {
+      const g = new THREE.Group();
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 2.6, 5), M.wood); pole.position.y = 1.3;
+      const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.6), new THREE.MeshStandardMaterial({ color: 0x50a0ff, side: THREE.DoubleSide })); flag.position.set(0.55, 2.2, 0);
+      g.add(pole, flag); arrivalMarker = g; scene.add(g);
+    }
+    arrivalMarker.position.set(x, Math.max(0, heightAt(x, z)) + 0.02, z);
+  }
+  function arrivalSpot() { return arrivalPoint || getAnchors().shore; }
+  function farOffshore(p) {                    // punto mar adentro frente al de llegada (para verlos venir)
+    const c = villageCenter || { x: 0, z: 0 }; let dx = p.x - c.x, dz = p.z - c.z, d = Math.hypot(dx, dz) || 1;
+    const D = Math.min(SIZE * 0.45, 320); return { x: p.x + dx / d * D, z: p.z + dz / d * D };
+  }
   // destino de un recién llegado: con otros → va donde ellos; primero → a los árboles
   function gatherTarget() {
     const others = humans.filter((x) => !x.arriving && x.data.home);
@@ -464,9 +482,9 @@ export async function createHumanSystem(ctx) {
     const mesh = buildHumanMesh(data.shirt, data.height);
     group.add(mesh);
     let sx, sz;
-    if (arriving) { const sh = getAnchors().shore; sx = sh.x; sz = sh.z; }      // llega por la orilla
+    if (arriving) { const off = farOffshore(arrivalSpot()); sx = off.x; sz = off.z; }   // aparece lejos en el mar y se acerca
     else { const hp = data.home ? toLand(data.home.x, data.home.z) : toLand(0, 0); data.home = hp; sx = hp.x; sz = hp.z; }
-    const h = { data, mesh, home: null, homeRef: null, builderOf: null, tool: null, px: sx, pz: sz, tx: sx, tz: sz, t: Math.random() * 6.283, retarget: 0, arriving: !!arriving, _gather: null };
+    const h = { data, mesh, home: null, homeRef: null, builderOf: null, tool: null, px: sx, pz: sz, tx: sx, tz: sz, t: Math.random() * 6.283, retarget: 0, arriving: !!arriving, incoming: !!arriving, _gather: null };
     attachTool(h);
     humans.push(h);
     return h;
@@ -529,6 +547,8 @@ export async function createHumanSystem(ctx) {
     while (civicGroup.children.length) civicGroup.remove(civicGroup.children[0]);
     for (const f of fires) scene.remove(f.light); fires.length = 0;
     while (pathGroup.children.length) pathGroup.remove(pathGroup.children[0]); buildingPts.length = 0; pathGrows.length = 0;
+    if (arrivalMarker) { scene.remove(arrivalMarker); arrivalMarker = null; } arrivalPoint = null; metaSet('arrival', null);
+    if (ctx.onReset) ctx.onReset();           // limpia zonas pintadas (lado builder)
     await dbClear('humans'); refreshPanel();
   }
 
@@ -542,10 +562,16 @@ export async function createHumanSystem(ctx) {
     updateHomeBuilds(dt);                               // viviendas se levantan por fases
     updatePaths(dt);                                    // caminos se van marcando
     for (const h of humans) {
-      if (h.arriving) {                                 // recién llegado: ¿hay otros? va con ellos; si no, a los árboles
-        h.mesh.visible = true;
+      if (h.arriving) {
+        h.mesh.visible = true; h.t += dt;
+        if (h.incoming) {                               // viene desde lejos por el mar hacia el punto de llegada
+          const ap = arrivalSpot(), dx = ap.x - h.px, dz = ap.z - h.pz, d = Math.hypot(dx, dz);
+          if (d > 1.5 && !isLand(h.px, h.pz)) { h.px += dx / d * BOAT * dt; h.pz += dz / d * BOAT * dt; h.mesh.rotation.y = Math.atan2(dx, dz); h.mesh.position.set(h.px, 0.35 + Math.sin(h.t * 2) * 0.08, h.pz); }
+          else { h.incoming = false; h._gather = null; h.stuck = 0; }   // tocó tierra → camina al pueblo
+          continue;
+        }
         if (!h._gather) h._gather = gatherTarget();
-        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 6) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }   // llegó o no puede → se asienta donde está
+        if (stepLand(h, h._gather.x, h._gather.z, WALK, dt) || (h.stuck || 0) > 6) { h.arriving = false; h.stuck = 0; h.data.home = toLand(h.px, h.pz); dbPut('humans', h.data); }
         continue;
       }
       if (buildEra > 0 && !h.homeRef) assignHome(h);     // ¿hay etapa activa? consigue/levanta vivienda
@@ -698,6 +724,7 @@ export async function createHumanSystem(ctx) {
   const savedRes = await metaGet('resources', null); if (savedRes) Object.assign(resources, savedRes);
   buildEra = await metaGet('buildEra', 0);
   for (const k of await metaGet('allowed', [])) allowed.add(k);
+  const savedArr = await metaGet('arrival', null); if (savedArr) setArrival(savedArr.x, savedArr.z);
   const saved = (await dbGetAll('humans')).sort((a, b) => a.arrival - b.arrival);
   for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d, false); }
   if (saved.length) { recomputeTiers(null); checkCivic(true); ensureFires(); }   // normaliza, reconstruye lo comunitario y las fogatas
@@ -711,5 +738,5 @@ export async function createHumanSystem(ctx) {
   function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); }
   function eraAssets() { return (ERA_ASSETS[buildEra] || []).map((k) => ({ key: k, label: ASSET_LABEL[k], on: allowed.has(k) })); }
   function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const f of fires) scene.remove(f.light); panel.remove(); styleEl.remove(); }
-  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, setAllowed, eraAssets, dispose, count: () => humans.length };
+  return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, setAllowed, eraAssets, setArrival, dispose, count: () => humans.length };
 }

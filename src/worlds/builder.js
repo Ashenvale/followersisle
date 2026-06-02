@@ -1717,6 +1717,7 @@ export async function create({ renderer, mode }) {
     let col = 0xffe27a;                              // esculpir
     if (kind === 'asset') col = 0x7CFF9B;
     else if (kind === 'zone') col = key === 1 ? 0x50a0ff : key === 2 ? 0xffa030 : 0xff7a7a;
+    else if (kind === 'arrival') col = 0x40e0ff;
     else if (kind === 'biome') col = key > 0 ? rgbHex(BIOMES[biomeKeys[key - 1]].color) : 0xff7a7a;
     ring.material.color.set(col);
     const selId = (kind === 'sculpt' || kind === 'nav') ? kind : kind[0] + ':' + key;
@@ -1740,6 +1741,7 @@ export async function create({ renderer, mode }) {
     if (selKind === 'nav') return;                    // modo navegar: el clic-izq no edita el terreno
     if (!castToTerrain(ev)) return;
     if (selKind === 'asset') placeAsset(selKey, hit.x, hit.y, hit.z);
+    else if (selKind === 'arrival') { if (humanSys) { humanSys.setArrival(hit.x, hit.z); toast('📍 Punto de llegada fijado'); } }
     else if (selKind === 'biome') { sculpting = true; paintBiome(selKey); }
     else if (selKind === 'zone') { sculpting = true; paintZone(selKey); }
     else if (selKind === 'sculpt') { sculpting = true; flattenTarget = hit.y; stroke(); }
@@ -2922,6 +2924,7 @@ export async function create({ renderer, mode }) {
     humanSys = await createHumanSystem({
       scene, camera, controls, heightAt, groundAt: heightBilinear, findReliefSpots, terrainClassAt, zoneSpots, SIZE, toast,
       getTime: () => params.timeOfDay, cullDist: SIZE * 0.6,
+      onReset: () => { if (zones) zones.fill(0); zoneCounts[0] = zoneCounts[1] = zoneCounts[2] = 0; zonesDirty = true; saveZones(); recolorAll(); },
     });
     if (MANAGE_MODE) humanSys.showPanel();
   } catch (e) { console.error('humanSys', e); }
@@ -2929,16 +2932,20 @@ export async function create({ renderer, mode }) {
   // ---- menú de CONSTRUCCIÓN (modo gestión): pintar zonas dónde se permite construir + etapa ----
   let buildToolsEl = null;
   if (MANAGE_MODE) {
+    params.brushSize = Math.max(3, Math.round(SIZE / 70)); resizeRing(); brushCtrl?.updateDisplay();   // pincel chico para zonas
+    camera.position.set(0, SIZE * 0.95, SIZE * 0.32); controls.target.set(0, 0, 0); controls.update();  // vista más de arriba
     buildToolsEl = document.createElement('div');
-    buildToolsEl.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:27;display:flex;flex-wrap:wrap;gap:6px;align-items:center;' +
+    buildToolsEl.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:27;display:flex;flex-wrap:wrap;gap:6px;align-items:center;max-width:92vw;' +
       'background:rgba(10,16,28,.72);border:1px solid rgba(160,190,255,.25);border-radius:10px;padding:7px 12px;backdrop-filter:blur(6px);font-family:system-ui,sans-serif;color:#e7eefc;font-size:13px;';
     const eras = ['Sin construir', 'Campamento (carpas)', 'Aldea (chozas)', 'Pueblo (cabañas)', 'Ciudad (casas)'];
     const bs = 'cursor:pointer;background:rgba(40,60,95,.6);color:#e7eefc;border:1px solid transparent;border-radius:7px;padding:5px 9px;font-size:13px;';
-    buildToolsEl.innerHTML = '<b>🏗️ Construir en:</b>' +
+    buildToolsEl.innerHTML = '<b>🏗️</b>' +
       `<button style="${bs}" data-z="1">🏠 Residencia</button><button style="${bs}" data-z="2">🛠️ Servicios</button>` +
-      `<button style="${bs}" data-z="0">🧽 Borrar</button><button style="${bs}" data-z="nav">✋ Mover</button>` +
-      `<label style="margin-left:4px;"><input type="checkbox" id="ct-show" checked> ver zonas</label>` +
-      `<span style="margin-left:6px;">Etapa</span><select id="ct-era" style="${bs}">` + eras.map((l, i) => `<option value="${i}"${i === (humanSys ? humanSys.getEra() : 0) ? ' selected' : ''}>${l}</option>`).join('') + '</select>' +
+      `<button style="${bs}" data-z="0">🧽 Borrar</button><button style="${bs}" data-tool="arrival">📍 Llegada</button><button style="${bs}" data-z="nav">✋ Mover</button>` +
+      `<label style="margin-left:2px;">pincel <input id="ct-brush" type="range" min="2" max="60" value="${params.brushSize}" style="width:74px;vertical-align:middle;"></label>` +
+      `<label><input type="checkbox" id="ct-show" checked> ver zonas</label>` +
+      `<span>Etapa</span><select id="ct-era" style="${bs}">` + eras.map((l, i) => `<option value="${i}"${i === (humanSys ? humanSys.getEra() : 0) ? ' selected' : ''}>${l}</option>`).join('') + '</select>' +
+      `<button style="${bs}background:rgba(140,50,55,.6);" data-tool="reset">🗑 Reiniciar mundo</button>` +
       '<div id="ct-assets" style="width:100%;margin-top:2px;color:#b9c8e0;"></div>';
     document.body.appendChild(buildToolsEl);
     const renderAssets = () => {
@@ -2946,9 +2953,15 @@ export async function create({ renderer, mode }) {
       const list = humanSys.eraAssets();
       el.innerHTML = list.length ? ('Permitir: ' + list.map((a) => `<label style="margin-right:8px;white-space:nowrap;"><input type="checkbox" data-a="${a.key}"${a.on ? ' checked' : ''}> ${a.label}</label>`).join('')) : '<i>elegí una etapa para permitir construcciones</i>';
     };
-    buildToolsEl.addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; const z = b.dataset.z; if (z === 'nav') setSel('nav', null); else setSel('zone', +z); });
+    buildToolsEl.addEventListener('click', (e) => {
+      const b = e.target.closest('button'); if (!b) return;
+      if (b.dataset.tool === 'arrival') { setSel('arrival', null); return; }
+      if (b.dataset.tool === 'reset') { if (confirm('¿Reiniciar el mundo? Se borran todos los followers, viviendas, fogatas, caminos y zonas.')) { humanSys && humanSys.resetAll(); toast('Mundo reiniciado'); } return; }
+      const z = b.dataset.z; if (z === 'nav') setSel('nav', null); else setSel('zone', +z);
+    });
     buildToolsEl.addEventListener('change', (e) => {
       if (e.target.id === 'ct-show') { params.showZones = e.target.checked; recolorAll(); }
+      else if (e.target.id === 'ct-brush') { params.brushSize = +e.target.value; resizeRing(); brushCtrl?.updateDisplay(); }
       else if (e.target.id === 'ct-era') { humanSys && humanSys.setEra(+e.target.value); renderAssets(); toast(+e.target.value ? 'Etapa activada' : 'Construcción detenida'); }
       else if (e.target.dataset.a) { humanSys && humanSys.setAllowed(e.target.dataset.a, e.target.checked); }
     });
