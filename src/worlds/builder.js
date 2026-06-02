@@ -1783,6 +1783,10 @@ export async function create({ renderer, mode }) {
   const birds = [], whales = [], sharks = [], dolphins = [], fishes = [];
   let faunaTime = 0;
   const birdMat  = new THREE.MeshStandardMaterial({ color: 0x2c2c34, roughness: 0.95, flatShading: true, side: THREE.DoubleSide });
+  const songMat  = new THREE.MeshStandardMaterial({ color: 0x8a5a32, roughness: 0.95, flatShading: true, side: THREE.DoubleSide });   // pájaro chico (come fruta)
+  const seaMat   = new THREE.MeshStandardMaterial({ color: 0xe6e0d2, roughness: 0.9, flatShading: true, side: THREE.DoubleSide });    // ave marina (come peces)
+  const raptorMat = new THREE.MeshStandardMaterial({ color: 0x33302a, roughness: 0.9, flatShading: true, side: THREE.DoubleSide });   // rapaz (come otras aves)
+  const flocks = [];   // bandadas de pájaros chicos (centro que deambula)
   const whaleMat = new THREE.MeshStandardMaterial({ color: 0x35506b, roughness: 0.75, flatShading: true });
   const sharkMat = new THREE.MeshStandardMaterial({ color: 0x6e7b86, roughness: 0.7, flatShading: true });
   const dolphinMat = new THREE.MeshStandardMaterial({ color: 0x93a8bd, roughness: 0.55, flatShading: true });
@@ -1792,14 +1796,15 @@ export async function create({ renderer, mode }) {
     new THREE.MeshStandardMaterial({ color: 0x6f93b4, roughness: 0.6, flatShading: true }),
     new THREE.MeshStandardMaterial({ color: 0xb9474a, roughness: 0.6, flatShading: true }),
   ];
-  function buildBird() {                       // ave: cuerpo (cono) + 2 alas planas que aletean
+  function buildBird(mat) {                     // ave: cuerpo (cono) + 2 alas planas que aletean
+    mat = mat || birdMat;
     const g = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.ConeGeometry(0.42, 2.4, 5), birdMat);
+    const body = new THREE.Mesh(new THREE.ConeGeometry(0.42, 2.4, 5), mat);
     body.rotation.x = Math.PI / 2;             // punta hacia +z (frente del vuelo)
     const wGeo = new THREE.PlaneGeometry(2.3, 1.0);
     const mkWing = (sign) => {
       const pivot = new THREE.Group();
-      const m = new THREE.Mesh(wGeo, birdMat);
+      const m = new THREE.Mesh(wGeo, mat);
       m.rotation.x = -Math.PI / 2;             // tumba el ala (plano horizontal)
       m.position.x = sign * 1.15;              // se extiende desde la raíz
       pivot.add(m); return pivot;
@@ -1918,18 +1923,27 @@ export async function create({ renderer, mode }) {
   }
   function spawnFauna() {
     clearFauna();
-    // --- AVES: bandada en círculos sobre la isla, a distintas alturas/radios ---
-    const nB = 9 + (Math.random() * 6 | 0);
-    for (let k = 0; k < nB; k++) {
-      const b = buildBird(); b.g.scale.setScalar(1.3 + Math.random() * 1.8);
-      faunaGroup.add(b.g);
-      birds.push(Object.assign(b, {
-        R: SIZE * (0.06 + Math.random() * 0.22),
-        alt: Math.max(60, LAND_MAX * (0.9 + Math.random() * 1.4)),
-        cx: (Math.random() - 0.5) * SIZE * 0.25, cz: (Math.random() - 0.5) * SIZE * 0.25,
-        ang: Math.random() * 6.283, spd: (0.1 + Math.random() * 0.12) * (Math.random() < 0.5 ? -1 : 1),
-        ph: Math.random() * 6.283, flap: 7 + Math.random() * 3,
-      }));
+    // --- AVES (ecología): bandadas de pájaros chicos (fruta) + aves marinas (peces) + rapaces (otras aves) ---
+    flocks.length = 0;
+    const nFlocks = 1 + (Math.random() * 2 | 0);
+    for (let f = 0; f < nFlocks; f++) {
+      const fl = { cx: (Math.random() - 0.5) * SIZE * 0.4, cz: (Math.random() - 0.5) * SIZE * 0.4, vx: 0, vz: 0, alt: Math.max(45, LAND_MAX * (0.7 + Math.random() * 0.6)), scatter: 0 };
+      flocks.push(fl);
+      const nS = 5 + (Math.random() * 6 | 0);
+      for (let k = 0; k < nS; k++) {
+        const b = buildBird(songMat); b.g.scale.setScalar(0.7 + Math.random() * 0.5); faunaGroup.add(b.g);
+        birds.push(Object.assign(b, { kind: 'song', flock: fl, R: 6 + Math.random() * 14, ang: Math.random() * 6.283, spd: (0.5 + Math.random() * 0.5) * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 11 + Math.random() * 4 }));
+      }
+    }
+    const nSea = 2 + (Math.random() * 3 | 0);
+    for (let k = 0; k < nSea; k++) {
+      const b = buildBird(seaMat); b.g.scale.setScalar(1.4 + Math.random() * 0.8); faunaGroup.add(b.g);
+      birds.push(Object.assign(b, { kind: 'sea', R: waterRingRadius(SIZE * (0.34 + Math.random() * 0.12)), alt: 22 + Math.random() * 18, cx: 0, cz: 0, ang: Math.random() * 6.283, spd: (0.12 + Math.random() * 0.1) * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 6 + Math.random() * 2, dive: 3 + Math.random() * 5 }));
+    }
+    const nR = Math.random() < 0.6 ? 1 : 0;
+    for (let k = 0; k < nR; k++) {
+      const b = buildBird(raptorMat); b.g.scale.setScalar(1.7 + Math.random() * 0.6); faunaGroup.add(b.g);
+      birds.push(Object.assign(b, { kind: 'raptor', R: SIZE * (0.1 + Math.random() * 0.12), alt: Math.max(80, LAND_MAX * 1.5), cx: (Math.random() - 0.5) * SIZE * 0.2, cz: (Math.random() - 0.5) * SIZE * 0.2, ang: Math.random() * 6.283, spd: 0.14 * (Math.random() < 0.5 ? -1 : 1), ph: Math.random() * 6.283, flap: 5, hunt: 5 + Math.random() * 5 }));
     }
     // --- BALLENAS: BAJA probabilidad; orbitan en aguas profundas; salen a la superficie CADA TANTO ---
     // base ~18 m × escala 1.0-1.6 → 18-29 m (azul real ~25-33 m)
@@ -2026,11 +2040,37 @@ export async function create({ renderer, mode }) {
   }
   function updateFauna(dt) {
     faunaTime += dt; const t = faunaTime;
-    for (const b of birds) {                    // aves: círculo + bobeo + aleteo
-      b.ang += b.spd * dt; const sgn = Math.sign(b.spd);
-      b.g.position.set(b.cx + Math.cos(b.ang) * b.R, b.alt + Math.sin(t * 0.7 + b.ph) * 6, b.cz + Math.sin(b.ang) * b.R);
-      b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
+    for (const fl of flocks) {                  // bandadas: el centro deambula sobre la isla (huye al ser atacada)
+      fl.vx += (Math.random() - 0.5) * dt * 4; fl.vz += (Math.random() - 0.5) * dt * 4;
+      const sp = Math.hypot(fl.vx, fl.vz), mx = fl.scatter > 0 ? 16 : 5; if (sp > mx) { fl.vx *= mx / sp; fl.vz *= mx / sp; }
+      fl.cx += fl.vx * dt; fl.cz += fl.vz * dt;
+      const lim = SIZE * 0.4; if (Math.abs(fl.cx) > lim) { fl.cx = Math.sign(fl.cx) * lim; fl.vx *= -0.6; } if (Math.abs(fl.cz) > lim) { fl.cz = Math.sign(fl.cz) * lim; fl.vz *= -0.6; }
+      if (fl.scatter > 0) fl.scatter -= dt;
+    }
+    for (const b of birds) {                    // aves: aleteo + comportamiento por tipo
       const fa = Math.sin(t * b.flap + b.ph) * 0.7; b.lw.rotation.z = -fa; b.rw.rotation.z = fa;
+      const sgn = Math.sign(b.spd);
+      if (b.kind === 'song') {                  // pájaro chico: vuela en bandada (come fruta), se dispersa si hay rapaz
+        b.ang += b.spd * dt;
+        b.g.position.set(b.flock.cx + Math.cos(b.ang) * b.R, b.flock.alt + Math.sin(t * 1.6 + b.ph) * 3, b.flock.cz + Math.sin(b.ang) * b.R);
+        b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
+      } else if (b.kind === 'sea') {            // ave marina: orbita el mar y pica al agua a pescar
+        b.ang += b.spd * dt; b.dive -= dt;
+        let y = b.alt + Math.sin(t * 0.8 + b.ph) * 4;
+        if (b.dive > 0 && b.dive < 0.7) y = 2 + Math.abs(b.dive - 0.35) * 50;   // zambullida
+        if (b.dive <= 0) b.dive = 4 + Math.random() * 6;
+        b.g.position.set(Math.cos(b.ang) * b.R, y, Math.sin(b.ang) * b.R);
+        b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
+      } else if (b.kind === 'raptor') {         // rapaz: caza bandadas (las dispersa)
+        b.ang += b.spd * dt; b.hunt -= dt;
+        if (b.hunt <= 0 && flocks.length) { const fl = flocks[(Math.random() * flocks.length) | 0]; b.cx = fl.cx; b.cz = fl.cz; fl.scatter = 2.4; b.hunt = 6 + Math.random() * 6; }
+        b.g.position.set(b.cx + Math.cos(b.ang) * b.R, b.alt + Math.sin(t * 0.6 + b.ph) * 5, b.cz + Math.sin(b.ang) * b.R);
+        b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
+      } else {                                  // aves colocadas a mano (órbita simple)
+        b.ang += b.spd * dt;
+        b.g.position.set(b.cx + Math.cos(b.ang) * b.R, b.alt + Math.sin(t * 0.7 + b.ph) * 6, b.cz + Math.sin(b.ang) * b.R);
+        b.g.rotation.y = Math.atan2(-Math.sin(b.ang) * sgn, Math.cos(b.ang) * sgn);
+      }
     }
     for (const w of whales) {                   // ballenas: máquina de estados (espera larga ↔ pasada)
       if (w.state === 'wait') {
