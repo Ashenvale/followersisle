@@ -121,6 +121,10 @@ export async function createHumanSystem(ctx) {
   const ERA_TIER = [0, 0, 1, 2, 3];          // tier de vivienda según la etapa elegida
   const HOME_CAP = [1, 2, 3, 5];             // capacidad de humanos por vivienda (carpa→casa)
   const HOME_KEY = ['carpa', 'choza', 'cabaña', 'casa'];
+  const HOME_COST = [{ madera: 4 }, { madera: 10, piedra: 3 }, { madera: 22, piedra: 10 }, { madera: 40, piedra: 20 }];   // construir/mejorar cuesta recursos
+  function popTier(n) { return n < 8 ? 0 : n < 25 ? 1 : n < 70 ? 2 : 3; }   // el nivel de vivienda crece con los followers
+  function canAfford(c) { for (const k in c) if ((resources[k] || 0) < c[k]) return false; return true; }
+  function payCost(c) { for (const k in c) resources[k] -= c[k]; }
   // assets DISPONIBLES por etapa (el usuario elige cuáles permitir)
   const ERA_ASSETS = {
     1: ['carpa', 'fogata'],
@@ -332,11 +336,24 @@ export async function createHumanSystem(ctx) {
       if (p >= 1) { hm.building = false; hm.group.remove(hm.scaffold); hm.scaffold.traverse((o) => o.geometry?.dispose?.()); hm.model.scale.y = 1; addBuildingPoint(hm.x, hm.z); }
     }
   }
-  function assignHome(h) {                     // se muda a una con lugar; si no, construye una nueva (si está permitida)
+  function assignHome(h) {                     // se muda a una con lugar; si no, construye (nivel por followers + recursos)
     if (h.homeRef) return;
     for (const hm of homesReg) if (hm.occ.size < hm.cap) { hm.occ.add(h.data.id); h.homeRef = hm; return; }
-    if (!homeAllowed()) return;                // el usuario aún no permitió ese tipo de vivienda
-    const hm = startHome(ERA_TIER[buildEra]); hm.occ.add(h.data.id); h.homeRef = hm; h.builderOf = hm;
+    let tier = ERA_TIER[buildEra];                                                  // el NIVEL lo elegís vos (Etapa)
+    while (tier >= 0 && !allowed.has(HOME_KEY[tier])) tier--;                        // baja al mejor permitido
+    if (tier < 0 || !canAfford(HOME_COST[tier])) return;                            // sin permiso o sin material → sigue juntando
+    payCost(HOME_COST[tier]);
+    const hm = startHome(tier); hm.occ.add(h.data.id); h.homeRef = hm; h.builderOf = hm;
+  }
+  function upgradeHomes() {                     // sube las viviendas existentes al nivel que ELEGISTE (si hay material)
+    const target = ERA_TIER[buildEra];
+    for (const hm of homesReg) {
+      if (hm.building || hm.tier >= target || !allowed.has(HOME_KEY[target]) || !canAfford(HOME_COST[target])) continue;
+      payCost(HOME_COST[target]);
+      hm.tier = target; hm.cap = HOME_CAP[target]; hm.building = true; hm.buildT = 0; hm.stage = 0; hm.total = BUILD_TIME[target];
+      hm.group.remove(hm.model); hm.model.traverse((o) => o.geometry?.dispose?.()); hm.model = buildHome(target, 0); hm.group.add(hm.model);
+      hm.scaffold = buildScaffold(); hm.group.add(hm.scaffold);
+    }
   }
   function checkCivic(instant) {
     if (buildEra < 1) return;
@@ -835,9 +852,9 @@ export async function createHumanSystem(ctx) {
     buildEra = n; metaSet('buildEra', buildEra);
     const list = ERA_ASSETS[n] || [];
     if (n > 0 && !list.some((k) => allowed.has(k))) { allowed.add(HOME_KEY[ERA_TIER[n]]); allowed.add('fogata'); metaSet('allowed', [...allowed]); }   // por defecto: vivienda + fogata
-    checkCivic(); ensureFires(); reassignJobs();        // la etapa desbloquea nuevos oficios
+    checkCivic(); ensureFires(); reassignJobs(); upgradeHomes();   // la etapa desbloquea oficios y sube las viviendas
   }
-  function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); }
+  function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); upgradeHomes(); }
   function eraAssets() { return (ERA_ASSETS[buildEra] || []).map((k) => ({ key: k, label: ASSET_LABEL[k], on: allowed.has(k) })); }
   function dispose() { scene.remove(group); scene.remove(homeGroup); scene.remove(civicGroup); scene.remove(pathGroup); for (const r of rafts) scene.remove(r.mesh); for (const f of fires) scene.remove(f.light); if (arrivalMarker) scene.remove(arrivalMarker); detailEl?.remove(); panel.remove(); styleEl.remove(); }
   return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, setEra, getEra: () => buildEra, setAllowed, eraAssets, setArrival, dispose, count: () => humans.length };
