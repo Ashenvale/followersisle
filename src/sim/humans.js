@@ -1,168 +1,279 @@
-// Sistema de HUMANOS (followers de IG). Cada follower = un humano con stats random (signo, personalidad,
-// trabajo), hogar asignado, rango por antigüedad y comportamiento día/noche (no todos duermen).
+// Sistema de HUMANOS (followers de IG). Cada follower = un humano con stats random (signo, personalidad),
+// trabajo y rango por ANTIGÜEDAD (al llegar uno nuevo, los anteriores ascienden), hogar que mejora con el
+// rango (carpa→choza→cabaña→casa), y comportamiento día/noche con actividad según el oficio.
 // Persistencia en IndexedDB (escala a miles). El render/ctx lo provee el mundo (builder).
 import * as THREE from 'three';
-import { dbInit, dbGetAll, dbPut, dbDelete, dbClear, metaGet, metaSet } from './db.js';
+import { dbInit, dbGetAll, dbPut, dbDelete, dbClear, metaSet } from './db.js';
 
 const SIGNS = ['Aries', 'Tauro', 'Géminis', 'Cáncer', 'Leo', 'Virgo', 'Libra', 'Escorpio', 'Sagitario', 'Capricornio', 'Acuario', 'Piscis'];
 const PERSONALITIES = ['Trabajador', 'Soñador', 'Líder', 'Tímido', 'Aventurero', 'Sociable', 'Solitario', 'Creativo', 'Pragmático', 'Rebelde', 'Leal', 'Ambicioso', 'Glotón', 'Bromista'];
-const JOBS = ['Recolector', 'Pescador', 'Leñador', 'Cazador', 'Agricultor', 'Constructor', 'Comerciante', 'Artesano', 'Minero', 'Marinero', 'Estudiante', 'Cocinero', 'Médico', 'Maestro', 'Capataz'];
-const RANKS = ['Recién llegado', 'Poblador', 'Vecino', 'Veterano', 'Notable', 'Pionero'];   // de menos a más antiguo
+// oficios por nivel (de recién llegado a fundador); al ascender se pasa al nivel siguiente
+const TIERS = [
+  ['Recolector', 'Pescador'],
+  ['Leñador', 'Cazador', 'Agricultor'],
+  ['Constructor', 'Artesano', 'Minero', 'Marinero'],
+  ['Comerciante', 'Cocinero', 'Estudiante'],
+  ['Médico', 'Maestro'],
+  ['Capataz'],
+  ['Alcalde'],
+];
+const RANK_NAMES = ['Recién llegado', 'Poblador', 'Vecino', 'Veterano', 'Notable', 'Pionero', 'Fundador'];
 const MILESTONES = [1, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000];
 const SHIRTS = [0x2f7fc4, 0xc44f3a, 0x3ab36b, 0xb58b2f, 0x7a4fc4, 0xc43a8e, 0x3ab0c4, 0xc4a23a];
 const pick = (a) => a[(Math.random() * a.length) | 0];
 
-// rango por antigüedad: el #1 es Fundador; los más viejos rangos altos, los nuevos bajos
-function rankOf(arrival, total) {
-  if (arrival === 1) return 'Fundador';
+// nivel por antigüedad: 0 = recién llegado … TIERS.length-1 = fundador. El #1 siempre es el máximo.
+function tierOf(arrival, total) {
+  if (arrival === 1) return TIERS.length - 1;
   const seniority = 1 - (arrival - 1) / Math.max(1, total - 1);   // 1 = más viejo, 0 = más nuevo
-  return RANKS[Math.min(RANKS.length - 1, Math.floor(seniority * RANKS.length))];
+  return Math.min(TIERS.length - 1, Math.floor(seniority * TIERS.length));
 }
 
 export async function createHumanSystem(ctx) {
-  // ctx = { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast, mode }
+  // ctx = { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast, cullDist }
   const { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast } = ctx;
   await dbInit();
   const group = new THREE.Group(); scene.add(group);
-  const tentGroup = new THREE.Group(); scene.add(tentGroup);
-  const humans = [];                       // {data, mesh, tent, px, pz, tx, tz, t}
-  let villageCenter = null;
+  const homeGroup = new THREE.Group(); scene.add(homeGroup);
+  const humans = [];
+  let villageCenter = null, anchors = null;
   const skinMat = new THREE.MeshStandardMaterial({ color: 0xe0b48c, roughness: 0.7 });
-  const tentMat = new THREE.MeshStandardMaterial({ color: 0xb9824f, roughness: 0.85, flatShading: true });
+  const M = {
+    tent: new THREE.MeshStandardMaterial({ color: 0xb9824f, roughness: 0.85, flatShading: true }),
+    thatch: new THREE.MeshStandardMaterial({ color: 0x9a7b3e, roughness: 0.9, flatShading: true }),
+    mud: new THREE.MeshStandardMaterial({ color: 0xa9885f, roughness: 0.95, flatShading: true }),
+    wood: new THREE.MeshStandardMaterial({ color: 0x8a5a36, roughness: 0.85, flatShading: true }),
+    roof: new THREE.MeshStandardMaterial({ color: 0x70392a, roughness: 0.8, flatShading: true }),
+    house: new THREE.MeshStandardMaterial({ color: 0xcdbfa6, roughness: 0.8, flatShading: true }),
+  };
 
-  function buildHumanMesh(shirt, h) {
+  function buildHumanMesh(shirt, scale) {
     const g = new THREE.Group();
     const m = new THREE.MeshStandardMaterial({ color: shirt, roughness: 0.6 });
     const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.85, 6, 12), m);
     body.position.y = 0.675; body.castShadow = true;
     const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 14, 12), skinMat);
     head.position.y = 1.56; head.castShadow = true;
-    g.add(body, head); g.scale.setScalar(h);
+    g.add(body, head); g.scale.setScalar(scale);
     return g;
   }
-  function buildTent() {                    // choza/carpa simple (cono)
-    const t = new THREE.Mesh(new THREE.ConeGeometry(1.1, 1.4, 5), tentMat);
-    t.castShadow = true; t.receiveShadow = true;
-    return t;
+  // nº de fases de obra y duración (s) por tipo de vivienda
+  const STAGES = [2, 3, 4, 4];
+  const BUILD_TIME = [4, 8, 14, 20];
+  const post = (x, z, h) => { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, h, 5), M.wood); p.position.set(x, h / 2, z); return p; };
+  // construye la vivienda del nivel `tier` en la FASE `stage` (0..STAGES-1; la última = terminada)
+  function buildHome(tier, stage) {
+    const g = new THREE.Group();
+    const last = STAGES[tier] - 1; if (stage == null) stage = last;
+    if (tier <= 0) {                                   // CARPA: palos → lona
+      g.add(post(-0.5, 0, 1.3), post(0.5, 0, 1.3));
+      if (stage >= 1) { const t = new THREE.Mesh(new THREE.ConeGeometry(1.1, 1.4, 5), M.tent); t.position.y = 0.7; g.add(t); }
+    } else if (tier === 1) {                            // CHOZA: aro de barro → muro → techo de paja
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.1, stage >= 1 ? 1.0 : 0.3, 7), M.mud); base.position.y = (stage >= 1 ? 1.0 : 0.3) / 2; g.add(base);
+      if (stage >= 2) { const roof = new THREE.Mesh(new THREE.ConeGeometry(1.35, 1.0, 7), M.thatch); roof.position.y = 1.5; g.add(roof); }
+    } else if (tier === 2) {                            // CABAÑA: postes → piso → muros → techo
+      g.add(post(-1, -0.9, 1.4), post(1, -0.9, 1.4), post(-1, 0.9, 1.4), post(1, 0.9, 1.4));
+      if (stage >= 1) { const fl = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.18, 2.0), M.wood); fl.position.y = 0.1; g.add(fl); }
+      if (stage >= 2) { const w = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.3, 2.0), M.wood); w.position.y = 0.75; g.add(w); }
+      if (stage >= 3) { const roof = new THREE.Mesh(new THREE.ConeGeometry(1.8, 1.0, 4), M.roof); roof.position.y = 1.9; roof.rotation.y = Math.PI / 4; g.add(roof); }
+    } else {                                            // CASA: cimientos → medio muro → muro → techo+chimenea
+      const slab = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.2, 2.4), M.mud); slab.position.y = 0.1; g.add(slab);
+      g.add(post(-1.3, -1.1, 1.0), post(1.3, -1.1, 1.0), post(-1.3, 1.1, 1.0), post(1.3, 1.1, 1.0));
+      if (stage >= 1) { const w = new THREE.Mesh(new THREE.BoxGeometry(2.8, stage >= 2 ? 1.9 : 0.9, 2.4), M.house); w.position.y = (stage >= 2 ? 1.9 : 0.9) / 2 + 0.2; g.add(w); }
+      if (stage >= 3) {
+        const roof = new THREE.Mesh(new THREE.ConeGeometry(2.3, 1.1, 4), M.roof); roof.position.y = 2.45; roof.rotation.y = Math.PI / 4;
+        const chim = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.7, 0.3), M.house); chim.position.set(0.85, 2.45, 0.6);
+        g.add(roof, chim);
+      }
+    }
+    g.traverse((o) => { o.castShadow = true; o.receiveShadow = true; });
+    return g;
+  }
+  // ---- herramientas/assets que lleva el humano según el oficio ----
+  function buildTool(job) {
+    const g = new THREE.Group();
+    const handle = (len) => new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, len, 5), M.wood);
+    if (job === 'Leñador') { const h = handle(0.9); h.position.y = 0.45; const head = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.16, 0.05), M.roof); head.position.set(0.06, 0.86, 0); g.add(h, head); }
+    else if (job === 'Minero') { const h = handle(0.9); h.position.y = 0.45; const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.06, 0.06), M.roof); head.position.y = 0.88; head.rotation.z = 0.4; g.add(h, head); }
+    else if (job === 'Pescador' || job === 'Marinero') { const rod = handle(1.3); rod.position.y = 0.6; rod.rotation.z = -0.5; g.add(rod); }
+    else if (job === 'Constructor' || job === 'Artesano') { const h = handle(0.7); h.position.y = 0.35; const head = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.12, 0.1), M.wood); head.position.y = 0.7; g.add(h, head); }
+    else if (job === 'Recolector' || job === 'Agricultor' || job === 'Cazador') { const b = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.12, 0.22, 7), M.thatch); b.position.y = 0.3; g.add(b); }
+    else if (job === 'Estudiante' || job === 'Maestro') { const bk = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.18, 0.05), M.house); bk.position.y = 0.5; g.add(bk); }
+    else return null;
+    g.position.set(0.3, 0, 0.05);                       // en la "mano"
+    g.traverse((o) => { o.castShadow = true; });
+    return g;
+  }
+  function buildBoat() {                                // barca en la orilla (Pescadores/Marineros)
+    const g = new THREE.Group();
+    const hull = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.35, 3.2, 7, 1, false, 0, Math.PI), M.wood);
+    hull.rotation.set(Math.PI / 2, 0, Math.PI / 2); hull.scale.set(1, 1, 0.6);
+    g.add(hull); g.traverse((o) => { o.castShadow = true; o.receiveShadow = true; });
+    return g;
   }
 
-  // elige una posición de hogar en tierra (cluster que crece con la población)
   function pickHome() {
     if (!villageCenter) {
       const spots = findReliefSpots('llano', 4).concat(findReliefSpots('playa', 4));
       villageCenter = spots[0] ? { x: spots[0].x, z: spots[0].z } : { x: 0, z: 0 };
     }
     const spread = SIZE * (0.03 + 0.02 * Math.sqrt(humans.length + 1));
-    for (let tryN = 0; tryN < 24; tryN++) {
+    for (let n = 0; n < 24; n++) {
       const a = Math.random() * 6.283, r = Math.random() * spread;
       const x = villageCenter.x + Math.cos(a) * r, z = villageCenter.z + Math.sin(a) * r;
-      if (heightAt(x, z) > 0.5) return { x, z };       // sobre tierra firme
+      if (heightAt(x, z) > 0.5) return { x, z };
     }
     return { x: villageCenter.x, z: villageCenter.z };
   }
-  function workNear(home) {
-    const a = Math.random() * 6.283, r = SIZE * (0.02 + Math.random() * 0.05);
-    let x = home.x + Math.cos(a) * r, z = home.z + Math.sin(a) * r;
-    if (heightAt(x, z) <= 0.5) { x = home.x; z = home.z; }
-    return { x, z };
+  // anclas de trabajo por tipo (se calculan una vez según el relieve)
+  function getAnchors() {
+    if (anchors) return anchors;
+    const c = villageCenter || { x: 0, z: 0 };
+    const one = (cls, fb) => { const s = findReliefSpots(cls, 3); return s[0] ? { x: s[0].x, z: s[0].z } : fb; };
+    anchors = {
+      shore: one('orilla', one('playa', c)),
+      forest: one('llano', one('meseta', c)),
+      mine: one('ladera', one('cima', c)),
+      plaza: c,
+    };
+    const boat = buildBoat();               // barca en la orilla
+    boat.position.set(anchors.shore.x, Math.max(0, heightAt(anchors.shore.x, anchors.shore.z)) + 0.15, anchors.shore.z);
+    homeGroup.add(boat);
+    return anchors;
+  }
+  function attachTool(h) {
+    if (h.tool) { h.mesh.remove(h.tool); h.tool.traverse((o) => o.geometry?.dispose?.()); h.tool = null; }
+    const t = buildTool(h.data.job);
+    if (t) { h.mesh.add(t); h.tool = t; }
+  }
+  function startBuild(h) { h.building = true; h.buildT = 0; h.stage = -1; rebuildHome(h, 0); }
+  function anchorFor(job) {
+    const A = getAnchors();
+    if (job === 'Pescador' || job === 'Marinero') return A.shore;
+    if (job === 'Leñador' || job === 'Recolector' || job === 'Cazador' || job === 'Agricultor') return A.forest;
+    if (job === 'Minero') return A.mine;
+    return A.plaza;   // Constructor, Artesano, Comerciante, Cocinero, Estudiante, Médico, Maestro, Capataz, Alcalde
   }
 
-  function spawn(data) {
+  function rebuildHome(h, stage) {
+    if (h.home) { homeGroup.remove(h.home); h.home.traverse((o) => o.geometry?.dispose?.()); }
+    h.home = buildHome(h.data.homeTier || 0, stage);
+    h.home.position.set(h.data.home.x, Math.max(0, heightAt(h.data.home.x, h.data.home.z)) + 0.02, h.data.home.z);
+    homeGroup.add(h.home);
+  }
+  function spawn(data, animateBuild) {
     const mesh = buildHumanMesh(data.shirt, data.height);
     group.add(mesh);
-    const tent = buildTent();
-    tent.position.set(data.home.x, Math.max(0, heightAt(data.home.x, data.home.z)) + 0.7, data.home.z);
-    tentGroup.add(tent);
-    const h = { data, mesh, tent, px: data.home.x, pz: data.home.z, tx: data.home.x, tz: data.home.z, t: Math.random() * 6.283, retarget: 0 };
+    const h = { data, mesh, home: null, tool: null, px: data.home.x, pz: data.home.z, tx: data.home.x, tz: data.home.z, t: Math.random() * 6.283, retarget: 0, building: false, buildT: 0, stage: -1 };
+    attachTool(h);
+    if (animateBuild) startBuild(h); else rebuildHome(h);   // recién llegado: obra por fases · carga: ya construida
     humans.push(h);
     return h;
   }
 
-  async function addFollower(name) {
-    const total = humans.length + 1;
-    const home = pickHome();
-    const data = {
-      id: 'h' + total + '-' + Date.now() + '-' + ((Math.random() * 1e6) | 0),
-      name: (name || 'Follower ' + total).trim(),
-      arrival: total,
-      sign: pick(SIGNS), personality: pick(PERSONALITIES), job: pick(JOBS),
-      shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25,
-      home, work: workNear(home),
-    };
-    await dbPut('humans', data);
-    spawn(data);
-    refreshPanel();
-    // logro por hito
-    if (MILESTONES.includes(total)) {
-      toast(total === 1 ? '🏆 ¡El primero en tocar tierra! 🌴' : '🏆 ¡Follower nº ' + total + '!');
-      metaSet('milestone', total);
-    } else {
-      toast('👤 ' + data.name + ' llegó a la isla (' + total + ')');
+  // recalcula nivel/oficio/vivienda de todos por antigüedad (ascensos); persiste los que cambian
+  function recomputeTiers(announcePrevId) {
+    const n = humans.length;
+    for (const h of humans) {
+      const d = h.data, tier = tierOf(d.arrival, n);
+      if (d.tier !== tier) {
+        d.tier = tier; d.job = pick(TIERS[tier]);
+        attachTool(h);                                 // nueva herramienta del oficio
+        const ht = Math.min(3, tier);
+        if (d.homeTier !== ht) { d.homeTier = ht; startBuild(h); }   // re-construye la vivienda mejorada por fases
+        dbPut('humans', d);
+        if (announcePrevId && d.id === announcePrevId) toast('⬆️ ' + d.name + ' ascendió a ' + d.job + ' · construyendo nueva casa');
+      }
     }
-    return data;
   }
 
+  async function addFollower(name) {
+    const total = humans.length + 1;
+    const prevId = humans.length ? humans[humans.length - 1].data.id : null;
+    const home = pickHome(), tier = tierOf(total, total);
+    const data = {
+      id: 'h' + total + '-' + Date.now() + '-' + ((Math.random() * 1e6) | 0),
+      name: (name || 'Follower ' + total).trim(), arrival: total,
+      sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pick(TIERS[tier]), homeTier: Math.min(3, tier),
+      shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25, home,
+    };
+    await dbPut('humans', data);
+    spawn(data, true);                      // llega y construye su carpa por fases
+    recomputeTiers(prevId);                 // el anterior puede ascender
+    refreshPanel();
+    if (MILESTONES.includes(total)) { toast(total === 1 ? '🏆 ¡El primero en tocar tierra! 🌴' : '🏆 ¡Follower nº ' + total + '!'); metaSet('milestone', total); }
+    else toast('👤 ' + data.name + ' llegó a la isla (' + total + ')');
+    return data;
+  }
   async function removeHuman(id) {
-    const i = humans.findIndex((h) => h.data.id === id);
-    if (i < 0) return;
+    const i = humans.findIndex((h) => h.data.id === id); if (i < 0) return;
     const h = humans[i];
-    group.remove(h.mesh); tentGroup.remove(h.tent);
-    h.mesh.traverse((o) => o.geometry?.dispose?.());
-    h.tent.geometry.dispose();
+    group.remove(h.mesh); h.mesh.traverse((o) => o.geometry?.dispose?.());
+    if (h.home) { homeGroup.remove(h.home); h.home.traverse((o) => o.geometry?.dispose?.()); }
     humans.splice(i, 1);
     await dbDelete('humans', id);
-    refreshPanel();
+    recomputeTiers(null); refreshPanel();
   }
-  async function reroll(id) {                 // "cambiar características"
+  async function reroll(id) {
     const h = humans.find((x) => x.data.id === id); if (!h) return;
-    h.data.sign = pick(SIGNS); h.data.personality = pick(PERSONALITIES); h.data.job = pick(JOBS);
+    h.data.sign = pick(SIGNS); h.data.personality = pick(PERSONALITIES);
     await dbPut('humans', h.data); refreshPanel();
   }
   async function resetAll() {
-    for (const h of humans) { group.remove(h.mesh); tentGroup.remove(h.tent); }
-    humans.length = 0; villageCenter = null;
+    for (const h of humans) { group.remove(h.mesh); if (h.home) homeGroup.remove(h.home); }
+    humans.length = 0; villageCenter = null; anchors = null;
     await dbClear('humans'); refreshPanel();
   }
 
-  // ---- comportamiento día/noche ----
+  // ---- comportamiento día/noche + actividad según oficio ----
   function update(dt) {
     const time = getTime();
     const night = time < 6 || time > 20.5;
     const cx = camera.position.x, cz = camera.position.z;
     const cull2 = (ctx.cullDist || SIZE * 0.6) ** 2;
     for (const h of humans) {
+      // progreso de obra (avanza siempre, aunque esté lejos o de noche)
+      if (h.building) {
+        const tt = h.data.homeTier || 0, stages = STAGES[tt], total = BUILD_TIME[tt];
+        h.buildT += dt;
+        const pr = Math.min(1, h.buildT / total), st = Math.min(stages - 1, Math.floor(pr * stages));
+        if (st !== h.stage) { h.stage = st; rebuildHome(h, st); }
+        if (pr >= 1) { h.building = false; rebuildHome(h, stages - 1); }
+      }
       const dxc = h.px - cx, dzc = h.pz - cz;
-      if (dxc * dxc + dzc * dzc > cull2) { h.mesh.visible = false; h.tent.visible = false; continue; }   // lejos → no render
-      h.mesh.visible = true; h.tent.visible = true;
-      // destino según hora
+      const far = dxc * dxc + dzc * dzc > cull2;
+      if (h.home) h.home.visible = !far;
+      if (far) { h.mesh.visible = false; continue; }
+      const sleeping = night && !h.data.nightOwl && !h.building;   // si construye, no duerme
+      if (sleeping) { h.mesh.visible = false; continue; }   // durmiendo dentro de su casa
+      h.mesh.visible = true;
       h.retarget -= dt;
-      const sleeping = night && !h.data.nightOwl;
-      if (sleeping) { h.tx = h.data.home.x; h.tz = h.data.home.z; }
-      else if (h.retarget <= 0) {                         // de día va al trabajo / deambula cerca
+      if (h.retarget <= 0) {
         h.retarget = 3 + Math.random() * 4;
-        const base = (night ? h.data.home : h.data.work);
-        const a = Math.random() * 6.283, r = SIZE * 0.015 * Math.random();
+        const base = h.building ? h.data.home : (night ? h.data.home : anchorFor(h.data.job));   // construye en su lote · de día al trabajo
+        const a = Math.random() * 6.283, r = SIZE * 0.012 * Math.random();
         h.tx = base.x + Math.cos(a) * r; h.tz = base.z + Math.sin(a) * r;
       }
-      // mover hacia el destino
       const dx = h.tx - h.px, dz = h.tz - h.pz, d = Math.hypot(dx, dz);
-      const spd = sleeping ? 0 : (0.6 + (h.data.personality === 'Aventurero' ? 0.5 : 0));
-      if (d > 0.2 && spd > 0) {
+      const spd = 0.6 + (h.data.personality === 'Aventurero' ? 0.5 : 0);
+      h.t += dt;
+      if (d > 0.4) {                                    // caminando
         h.px += dx / d * spd * dt; h.pz += dz / d * spd * dt;
         h.mesh.rotation.y = Math.atan2(dx, dz);
+        const gy = Math.max(0, heightAt(h.px, h.pz));
+        h.mesh.position.set(h.px, gy + Math.abs(Math.sin(h.t * 6)) * 0.04, h.pz);
+      } else {                                          // trabajando en el sitio (pequeña animación)
+        const gy = Math.max(0, heightAt(h.px, h.pz));
+        h.mesh.position.set(h.px, gy + Math.abs(Math.sin(h.t * 4)) * 0.02, h.pz);
+        h.mesh.rotation.y += Math.sin(h.t * 3) * 0.04;
       }
-      const gy = Math.max(0, heightAt(h.px, h.pz));
-      h.mesh.position.set(h.px, gy, h.pz);
-      // cabeceo sutil al caminar / quietos al dormir
-      h.t += dt; h.mesh.position.y = gy + (spd > 0 && d > 0.2 ? Math.abs(Math.sin(h.t * 6)) * 0.04 : 0);
-      if (sleeping) h.mesh.visible = false;               // durmiendo dentro de la carpa
     }
   }
 
   // ---- panel de gestión (DOM, izquierda) ----
   const panel = document.createElement('div');
   panel.id = 'sim-panel';
-  panel.style.cssText = 'position:fixed;top:64px;left:16px;z-index:26;width:250px;max-height:calc(100vh - 84px);' +
+  panel.style.cssText = 'position:fixed;top:64px;left:16px;z-index:26;width:255px;max-height:calc(100vh - 84px);' +
     'overflow-y:auto;display:none;background:rgba(10,16,28,.66);border:1px solid rgba(160,190,255,.25);' +
     'border-radius:12px;padding:10px;backdrop-filter:blur(6px);font-family:system-ui,sans-serif;color:#e7eefc;';
   document.body.appendChild(panel);
@@ -181,6 +292,7 @@ export async function createHumanSystem(ctx) {
   document.head.appendChild(styleEl);
 
   function nextMilestone(n) { return MILESTONES.find((m) => m > n) || null; }
+  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   function refreshPanel() {
     if (panel.style.display === 'none') return;
     const n = humans.length, nm = nextMilestone(n);
@@ -188,13 +300,12 @@ export async function createHumanSystem(ctx) {
     html += `<div class="stat">Población: <b>${n}</b>${nm ? ' · próximo hito: ' + nm : ''}</div>`;
     html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
     html += '<div id="sim-list">';
-    // muestra hasta 60 (los más nuevos primero) para no saturar el DOM
     const list = humans.slice().sort((a, b) => b.data.arrival - a.data.arrival).slice(0, 60);
     for (const h of list) {
-      const d = h.data;
+      const d = h.data, rank = RANK_NAMES[d.tier ?? 0];
       html += `<div class="h-item"><div class="hn">#${d.arrival} ${escapeHtml(d.name)}</div>` +
-        `<div class="hr">${rankOf(d.arrival, n)} · ${d.job} · ${d.sign} · ${d.personality}${d.nightOwl ? ' · 🌙' : ''}</div>` +
-        `<div class="acts"><button data-reroll="${d.id}" title="Cambiar características">🎲</button>` +
+        `<div class="hr">${rank} · ${d.job} · ${d.sign} · ${d.personality}${d.nightOwl ? ' · 🌙' : ''}</div>` +
+        `<div class="acts"><button data-reroll="${d.id}" title="Cambiar signo/personalidad">🎲</button>` +
         `<button data-del="${d.id}" title="Quitar">✕</button></div></div>`;
     }
     if (n > 60) html += `<div class="stat">… y ${n - 60} más</div>`;
@@ -202,7 +313,6 @@ export async function createHumanSystem(ctx) {
     if (n) html += '<button class="full" id="sim-reset" style="margin-top:8px;background:rgba(140,50,55,.5)">🗑 Reiniciar isla</button>';
     panel.innerHTML = html;
   }
-  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   panel.addEventListener('click', async (e) => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.id === 'sim-close') { hidePanel(); return; }
@@ -217,9 +327,9 @@ export async function createHumanSystem(ctx) {
 
   // carga inicial desde la DB
   const saved = (await dbGetAll('humans')).sort((a, b) => a.arrival - b.arrival);
-  for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d); }
+  for (const d of saved) { if (d.arrival === 1 && d.home) villageCenter = villageCenter || { x: d.home.x, z: d.home.z }; spawn(d, false); }
+  if (saved.length) recomputeTiers(null);   // normaliza niveles/viviendas de datos viejos
 
-  function dispose() { scene.remove(group); scene.remove(tentGroup); panel.remove(); styleEl.remove(); }
-
+  function dispose() { scene.remove(group); scene.remove(homeGroup); panel.remove(); styleEl.remove(); }
   return { addFollower, removeHuman, resetAll, update, showPanel, hidePanel, togglePanel, dispose, count: () => humans.length };
 }
