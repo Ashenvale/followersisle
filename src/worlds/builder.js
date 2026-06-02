@@ -18,6 +18,7 @@ import { createHumanSystem } from '../sim/humans.js';
 export async function create({ renderer, mode }) {
   const CINE_MODE = mode === 'cinematic';   // sección dedicada: oculta edición, enfoca clima/tiempo/escenas
   const MANAGE_MODE = mode === 'manage';    // sección Isla/Gestión: followers, trabajos, ciclos
+  const VIEW_MODE = mode === 'view';        // sección Ver Mundo: solo observar y seguir
   const params = {
     sizeKm: 1,              // tamaño del mapa (km)
     coverage: 35,           // % del mapa cubierto por tierra al generar
@@ -2428,7 +2429,7 @@ export async function create({ renderer, mode }) {
   fB.add(params, 'mar').name('Mostrar mar').onChange((v) => { water.visible = v; });
   fB.add(params, 'wireframe').name('Malla').onChange((v) => { mesh.material.wireframe = v; });
   fB.add(params, 'heatmap').name('🗺️ Relieve (heatmap)').onChange((v) => { recolorAll(); legendEl.style.display = v ? 'block' : 'none'; });
-  if (CINE_MODE || MANAGE_MODE) fB.hide();
+  if (CINE_MODE || MANAGE_MODE || VIEW_MODE) fB.hide();
   gui.add({ mg: () => humanSys && humanSys.togglePanel() }, 'mg').name('🏝️ Gestión (followers)');
   const fDN = gui.addFolder('Día / Noche');
   const timeCtrl = fDN.add(params, 'timeOfDay', 0, 24, 0.01).name('Hora').onChange(updateSky);
@@ -2761,7 +2762,7 @@ export async function create({ renderer, mode }) {
   h += '<div class="hintline">Elige una herramienta y usa clic-izquierdo sobre el terreno.</div></div>';
   paletteEl.innerHTML = h;
   document.body.appendChild(paletteEl);
-  if (CINE_MODE || MANAGE_MODE) paletteEl.style.display = 'none';   // estas secciones no editan el terreno
+  if (CINE_MODE || MANAGE_MODE || VIEW_MODE) paletteEl.style.display = 'none';   // estas secciones no editan el terreno
   const onPaletteClick = (e) => {
     const head = e.target.closest('.sec-h');          // clic en cabecera de sección → plega/expande
     if (head) {
@@ -2923,10 +2924,10 @@ export async function create({ renderer, mode }) {
   try {
     humanSys = await createHumanSystem({
       scene, camera, controls, heightAt, groundAt: heightBilinear, findReliefSpots, terrainClassAt, zoneSpots, SIZE, toast,
-      getTime: () => params.timeOfDay, cullDist: SIZE * 0.6,
+      getTime: () => params.timeOfDay, cullDist: SIZE * 0.6, viewOnly: VIEW_MODE,
       onReset: () => { if (zones) zones.fill(0); zoneCounts[0] = zoneCounts[1] = zoneCounts[2] = 0; zonesDirty = true; saveZones(); recolorAll(); },
     });
-    if (MANAGE_MODE) humanSys.showPanel();
+    if (MANAGE_MODE || VIEW_MODE) humanSys.showPanel();
   } catch (e) { console.error('humanSys', e); }
 
   // ---- menú de CONSTRUCCIÓN (modo gestión): pintar zonas dónde se permite construir + etapa ----
@@ -2973,6 +2974,8 @@ export async function create({ renderer, mode }) {
     terrainClassAt, findReliefSpots,   // API de geomorfología (p.ej. fauna que anida en 'acantilado')
     hint: CINE_MODE
       ? 'Cinemática · clic-DER orbita para encuadrar · ➕ Capturar plano · ▶ Reproducir/grabar escena · Esc detiene'
+      : VIEW_MODE
+      ? 'Ver Mundo · buscá un follower y tocá 👁 para seguirlo · clic-DER orbita · rueda zoom'
       : MANAGE_MODE
       ? 'Isla · ➕ Agregá followers en el panel izquierdo · cada uno llega y vive su ciclo día/noche · clic-DER orbita'
       : 'Tamaño del mapa en el panel · clic-izq esculpe/coloca · clic-DER orbita · arrastrar rueda mueve · girar rueda zoom',

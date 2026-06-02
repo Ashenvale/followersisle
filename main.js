@@ -5,6 +5,7 @@ const WORLDS = {
   3: { title: 'Constructor', subtitle: 'Constructor de terreno', module: () => import('./src/worlds/builder.js'), mode: 'build' },
   cine: { title: 'Cinemática', subtitle: 'Escenas y video', module: () => import('./src/worlds/builder.js'), mode: 'cinematic' },
   manage: { title: 'Isla', subtitle: 'Gestión de followers', module: () => import('./src/worlds/builder.js'), mode: 'manage' },
+  view: { title: 'Ver Mundo', subtitle: 'Observar y seguir', module: () => import('./src/worlds/builder.js'), mode: 'view' },
 };
 
 const app = document.getElementById('app');

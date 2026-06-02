@@ -32,6 +32,7 @@ function tierOf(arrival, total) {
 export async function createHumanSystem(ctx) {
   // ctx = { scene, heightAt, findReliefSpots, SIZE, getTime, camera, toast, cullDist }
   const { scene, heightAt, findReliefSpots, terrainClassAt, zoneSpots, SIZE, getTime, camera, controls, toast } = ctx;
+  const viewOnly = !!ctx.viewOnly;             // modo "Ver Mundo": solo observar y seguir
   const groundAt = ctx.groundAt || heightAt;   // altura EXACTA de la superficie (bilineal) → no se hunden
   let followId = null, searchQ = '', _followPrev = null;
   const _ft = new THREE.Vector3();   // scratch para seguir (3ra persona)
@@ -129,6 +130,26 @@ export async function createHumanSystem(ctx) {
   const ASSET_LABEL = { carpa: '⛺ Carpa', choza: '🛖 Choza', 'cabaña': '🏚️ Cabaña', casa: '🏠 Casa', fogata: '🔥 Fogata', aserradero: '🪚 Aserradero', muelle: '⚓ Muelle', granja: '🌾 Granja', mina: '⛏️ Mina', mercado: '🏪 Mercado' };
   const allowed = new Set();                 // assets que el usuario permite construir
   function homeAllowed() { return allowed.has(HOME_KEY[ERA_TIER[buildEra]]); }
+  // OFICIOS disponibles por etapa (acumulativo): cada etapa desbloquea nuevos trabajos
+  const ERA_JOBS = {
+    0: ['Recolector', 'Pescador', 'Leñador', 'Cazador'],
+    1: ['Recolector', 'Pescador', 'Leñador', 'Cazador'],
+    2: ['Recolector', 'Pescador', 'Leñador', 'Cazador', 'Agricultor', 'Constructor', 'Artesano'],
+    3: ['Recolector', 'Pescador', 'Leñador', 'Cazador', 'Agricultor', 'Constructor', 'Artesano', 'Minero', 'Marinero', 'Comerciante', 'Cocinero', 'Estudiante'],
+    4: ['Recolector', 'Pescador', 'Leñador', 'Cazador', 'Agricultor', 'Constructor', 'Artesano', 'Minero', 'Marinero', 'Comerciante', 'Cocinero', 'Estudiante', 'Médico', 'Maestro', 'Capataz', 'Alcalde'],
+  };
+  function jobPool() { return ERA_JOBS[buildEra] || ERA_JOBS[0]; }
+  function pickJob(arrival, total) {         // por antigüedad: nuevos → oficios básicos · veteranos → mejores (de los desbloqueados)
+    const pool = jobPool();
+    const sen = arrival === 1 ? 1 : 1 - (arrival - 1) / Math.max(1, total - 1);
+    let idx = Math.floor(sen * pool.length) + ((Math.random() * 3 | 0) - 1);
+    return pool[Math.min(pool.length - 1, Math.max(0, idx))];
+  }
+  function reassignJobs() {                   // re-asigna oficios al cambiar de etapa (se desbloquean trabajos)
+    const n = humans.length;
+    for (const h of humans) { const j = pickJob(h.data.arrival, n); if (j !== h.data.job) { h.data.job = j; attachTool(h); dbPut('humans', h.data); } }
+    refreshPanel();
+  }
   const homesReg = [];                       // viviendas reales {tier,x,z,cap,occ,group,model,scaffold,building,...}
   const HALF = SIZE * 0.5 * 0.96;
   function isLand(x, z) {                     // tierra firme caminable (ni agua, ni acantilado/barranco)
@@ -433,6 +454,8 @@ export async function createHumanSystem(ctx) {
   }
   // destino de un recién llegado: con otros → va donde ellos; primero → a los árboles
   function gatherTarget() {
+    const freeHome = homesReg.find((hm) => !hm.building && hm.occ.size < hm.cap);   // vivienda con lugar → va sola
+    if (freeHome) { const a = Math.random() * 6.283, r = 2 + Math.random() * 3; return toLand(freeHome.x + Math.cos(a) * r, freeHome.z + Math.sin(a) * r); }
     const others = humans.filter((x) => !x.arriving && x.data.home);
     if (others.length) { const o = others[(Math.random() * others.length) | 0], a = Math.random() * 6.283, r = 3 + Math.random() * 4; return toLand(o.data.home.x + Math.cos(a) * r, o.data.home.z + Math.sin(a) * r); }
     const f = getAnchors().forest; return toLand(f.x, f.z);
@@ -496,7 +519,7 @@ export async function createHumanSystem(ctx) {
     for (const h of humans) {
       const d = h.data, tier = tierOf(d.arrival, n);
       if (d.tier !== tier) {
-        d.tier = tier; d.job = pick(TIERS[tier]);
+        d.tier = tier; d.job = pickJob(d.arrival, n);   // ascenso → mejor oficio de la etapa
         attachTool(h);                                 // nueva herramienta del oficio
         const ht = Math.min(3, tier);
         if (d.homeTier !== ht) d.homeTier = ht;   // (las viviendas se gestionan por el registro/etapas)
@@ -513,7 +536,7 @@ export async function createHumanSystem(ctx) {
     const data = {
       id: 'h' + total + '-' + Date.now() + '-' + ((Math.random() * 1e6) | 0),
       name: (name || 'Follower ' + total).trim(), arrival: total,
-      sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pick(TIERS[tier]), homeTier: Math.min(3, tier),
+      sign: pick(SIGNS), personality: pick(PERSONALITIES), tier, job: pickJob(total, total), homeTier: Math.min(3, tier),
       shirt: pick(SHIRTS), height: 0.92 + Math.random() * 0.22, nightOwl: Math.random() < 0.25, home: null,   // el hogar se fija al asentarse
     };
     await dbPut('humans', data);
@@ -681,10 +704,10 @@ export async function createHumanSystem(ctx) {
   function refreshPanel() {
     if (panel.style.display === 'none') return;
     const n = humans.length, nm = nextMilestone(n);
-    let html = '<div class="ap-head"><span>🏝️ Isla · Followers</span><button id="sim-close">✕</button></div>';
+    let html = `<div class="ap-head"><span>${viewOnly ? '👁 Ver Mundo' : '🏝️ Isla · Followers'}</span><button id="sim-close">✕</button></div>`;
     html += `<div class="stat">Población: <b>${n}</b>${nm ? ' · próximo hito: ' + nm : ''}</div>`;
     html += `<div class="stat" id="sim-res">${resText()}</div>`;
-    html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
+    if (!viewOnly) html += '<button class="full" id="sim-add">➕ Agregar follower</button>';
     html += `<input id="sim-search" placeholder="🔍 buscar @nombre" value="${escapeHtml(searchQ)}" style="width:100%;margin:5px 0;padding:6px 8px;border-radius:8px;border:1px solid rgba(160,190,255,.2);background:rgba(40,60,95,.5);color:#e7eefc;font-size:13px;">`;
     if (followId) { const fh = humans.find((x) => x.data.id === followId); if (fh) html += `<div class="stat" style="display:flex;justify-content:space-between;align-items:center;">🎥 Siguiendo a <b>${escapeHtml(fh.data.name)}</b> <button id="sim-unfollow">⏹</button></div>`; }
     html += '<div id="sim-list">';
@@ -694,12 +717,12 @@ export async function createHumanSystem(ctx) {
       html += `<div class="h-item" data-name="${escapeHtml(('#' + d.arrival + ' ' + d.name).toLowerCase())}"><div class="hn">${MOOD_EMOJI[needKey(h)]} #${d.arrival} ${escapeHtml(d.name)}</div>` +
         `<div class="hr">${rank} · ${d.job} · ${d.sign} · ${d.personality}${d.nightOwl ? ' · 🌙' : ''}</div>` +
         `<div class="acts"><button data-follow="${d.id}" title="Seguir con la cámara">👁</button>` +
-        `<button data-reroll="${d.id}" title="Cambiar signo/personalidad">🎲</button>` +
-        `<button data-del="${d.id}" title="Quitar">✕</button></div></div>`;
+        (viewOnly ? '' : `<button data-reroll="${d.id}" title="Cambiar signo/personalidad">🎲</button><button data-del="${d.id}" title="Quitar">✕</button>`) +
+        `</div></div>`;
     }
     if (n > 200) html += `<div class="stat">… y ${n - 200} más (usá el buscador)</div>`;
     html += '</div>';
-    if (n) html += '<button class="full" id="sim-reset" style="margin-top:8px;background:rgba(140,50,55,.5)">🗑 Reiniciar isla</button>';
+    if (n && !viewOnly) html += '<button class="full" id="sim-reset" style="margin-top:8px;background:rgba(140,50,55,.5)">🗑 Reiniciar isla</button>';
     panel.innerHTML = html;
     applyFilter();
   }
@@ -733,7 +756,7 @@ export async function createHumanSystem(ctx) {
     buildEra = n; metaSet('buildEra', buildEra);
     const list = ERA_ASSETS[n] || [];
     if (n > 0 && !list.some((k) => allowed.has(k))) { allowed.add(HOME_KEY[ERA_TIER[n]]); allowed.add('fogata'); metaSet('allowed', [...allowed]); }   // por defecto: vivienda + fogata
-    checkCivic(); ensureFires();
+    checkCivic(); ensureFires(); reassignJobs();        // la etapa desbloquea nuevos oficios
   }
   function setAllowed(key, on) { if (on) allowed.add(key); else allowed.delete(key); metaSet('allowed', [...allowed]); checkCivic(); ensureFires(); }
   function eraAssets() { return (ERA_ASSETS[buildEra] || []).map((k) => ({ key: k, label: ASSET_LABEL[k], on: allowed.has(k) })); }
